@@ -15,30 +15,30 @@ DATA_ROOT = 'data'
 OUTPUT_DIR = 'processed_data'
 
 def parse_annotations(data_dir):
-    """Parse annotations and return paths + metadata"""
+    """Parse annotations and return paths + metadata per item"""
     samples = []
     ann_dir = os.path.join(data_dir, 'annos')
+    image_dir = os.path.join(data_dir, 'image')
     
     for fname in tqdm(os.listdir(ann_dir)):
         if not fname.endswith('.json'):
             continue
             
+        img_id = fname.split('.')[0]
+        img_path = os.path.join(image_dir, f"{img_id}.jpg")
+        
         with open(os.path.join(ann_dir, fname), 'r') as f:
             data = json.load(f)
-            img_id = fname.split('.')[0]
             tshirt_items = [
-                item for key, item in data.items()
+                (key, item) for key, item in data.items()
                 if key.startswith('item') and item['category_id'] == CATEGORY_ID
             ]
             
-            if tshirt_items:
-                # Store only the necessary metadata
+            for key, _ in tshirt_items:
                 samples.append({
-                    'img_path': os.path.join(data_dir, 'image', f"{img_id}.jpg"),
-                    'seg_data': [item['segmentation'] for item in tshirt_items],
-                    'landmark_data': [item['landmarks'] for item in tshirt_items],
-                    'img_size': [data['item1']['bounding_box'][2],  # Width
-                                 data['item1']['bounding_box'][3]] # Height
+                    'img_path': img_path,
+                    'img_id': img_id,
+                    'item_key': key
                 })
     
     return samples
@@ -75,35 +75,37 @@ def process_landmarks(landmarks, img_width, img_height):
         np.array(vis_mask + [0.0]*pad_len, dtype=np.float32)
     )
 
-
 def process_sample(sample):
     """Process single sample"""
+    # Load annotation
+    img_id = sample['img_id'].numpy().decode('utf-8')
+    item_key = sample['item_key'].numpy().decode('utf-8')
+    ann_path = os.path.join(DATA_ROOT, 'train', 'annos', f"{img_id}.json")
+    
+    with open(ann_path, 'r') as f:
+        data = json.load(f)
+        item = data[item_key]
+        seg = item['segmentation']
+        landmarks = item['landmarks']
+    
     # Load image
     image = tf.image.decode_jpeg(tf.io.read_file(sample['img_path']), channels=3)
-    orig_h, orig_w = sample['img_size']
+    orig_h = tf.shape(image)[0]
+    orig_w = tf.shape(image)[1]
     
     # Process masks
-    combined_mask = np.zeros((orig_h, orig_w, MAX_PARTS), dtype=np.float32)
-    all_landmarks = []
-    all_vis_masks = []
+    mask = create_part_masks(seg, orig_w, orig_h)
     
-    for seg, landmarks in zip(sample['seg_data'], sample['landmark_data']):
-        # Create part mask
-        mask = create_part_masks(seg, orig_w, orig_h)
-        combined_mask = np.maximum(combined_mask, mask)
-        
-        # Process landmarks
-        coords, vis_mask = process_landmarks(landmarks, orig_w, orig_h)
-        all_landmarks.append(coords)
-        all_vis_masks.append(vis_mask)
+    # Process landmarks
+    coords, vis_mask = process_landmarks(landmarks, orig_w, orig_h)
     
     # Resize and normalize
     image = tf.image.resize(image, IMG_SIZE) / 255.0
-    mask = tf.image.resize(combined_mask, IMG_SIZE)
-    landmarks = tf.concat(all_landmarks, axis=0) if all_landmarks else tf.zeros((MAX_LANDMARKS*2,))
-    vis_masks = tf.concat(all_vis_masks, axis=0) if all_vis_masks else tf.zeros((MAX_LANDMARKS*2,))
+    mask = tf.image.resize(mask, IMG_SIZE)
+    landmarks_tensor = tf.convert_to_tensor(coords, dtype=tf.float32)
+    vis_masks_tensor = tf.convert_to_tensor(vis_mask, dtype=tf.float32)
     
-    return image, (mask, landmarks, vis_masks)
+    return image, (mask, landmarks_tensor, vis_masks_tensor)
 
 # Create dataset from paths and metadata
 all_samples = parse_annotations(os.path.join(DATA_ROOT, 'train'))
@@ -114,21 +116,19 @@ train, val = train_test_split(train_val, test_size=0.2, random_state=42)
 def create_dataset(samples):
     return tf.data.Dataset.from_tensor_slices({
         'img_path': [s['img_path'] for s in samples],
-        'seg_data': [s['seg_data'] for s in samples],
-        'landmark_data': [s['landmark_data'] for s in samples],
-        'img_size': [s['img_size'] for s in samples]
+        'img_id': [s['img_id'] for s in samples],
+        'item_key': [s['item_key'] for s in samples]
     }).map(
         lambda x: tf.py_function(
             process_sample, [x],
-            (tf.float32, (tf.float32, tf.float32, tf.float32))
-        ),
+            (tf.float32, (tf.float32, tf.float32, tf.float32))),
         num_parallel_calls=tf.data.AUTOTUNE
     )
 
 # Create and save datasets
-train_ds = create_dataset(train).shuffle(1000).batch(8).prefetch(2)
-val_ds = create_dataset(val).batch(8).prefetch(2)
-test_ds = create_dataset(test).batch(8).prefetch(2)
+train_ds = create_dataset(train).shuffle(1000).batch(8).prefetch(tf.data.AUTOTUNE)
+val_ds = create_dataset(val).batch(8).prefetch(tf.data.AUTOTUNE)
+test_ds = create_dataset(test).batch(8).prefetch(tf.data.AUTOTUNE)
 
 # Save datasets
 os.makedirs(OUTPUT_DIR, exist_ok=True)
