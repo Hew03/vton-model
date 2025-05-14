@@ -15,6 +15,7 @@ def analyze_annotations(annos_dir):
     bbox_widths = []
     bbox_heights = []
     landmark_completeness = []
+    landmark_lengths = []  # New list to store landmark lengths
 
     annotation_files = [f for f in os.listdir(annos_dir) if f.endswith('.json')]
     
@@ -51,10 +52,11 @@ def analyze_annotations(annos_dir):
                 total_landmarks = len(landmarks) // 3
                 visible_landmarks = sum(1 for i in range(0, len(landmarks), 3) if landmarks[i+2] == 1)
                 landmark_completeness.append(visible_landmarks / total_landmarks if total_landmarks > 0 else 0)
+                landmark_lengths.append(len(landmarks))  # Record the length of landmarks array
 
-    plt.figure(figsize=(20, 25))
+    plt.figure(figsize=(20, 30))  # Increased figure height to accommodate new plot
 
-    plt.subplot(4, 2, 1)
+    plt.subplot(5, 2, 1)
     if submask_counts['short sleeve top']:
         max_submask = max(submask_counts['short sleeve top'])
         bins = range(0, max_submask + 2)
@@ -66,7 +68,7 @@ def analyze_annotations(annos_dir):
     plt.xlabel('Number of Submasks')
     plt.ylabel('Frequency')
     
-    plt.subplot(4, 2, 2)
+    plt.subplot(5, 2, 2)
     plt.pie(
         occlusion_dist_short.values(), 
         labels=[f'Occlusion {k}' for k in occlusion_dist_short.keys()], 
@@ -75,41 +77,52 @@ def analyze_annotations(annos_dir):
     )
     plt.title('Occlusion Distribution for T-shirts')
 
-    plt.subplot(4, 2, 3)
+    plt.subplot(5, 2, 3)
     plt.bar(scale_dist.keys(), scale_dist.values())
     plt.title('Scale Distribution')
     plt.xlabel('Scale Level')
     plt.ylabel('Count')
 
-    plt.subplot(4, 2, 4)
+    plt.subplot(5, 2, 4)
     plt.bar(viewpoint_dist.keys(), viewpoint_dist.values())
     plt.title('Viewpoint Distribution')
     plt.xlabel('Viewpoint Level')
     plt.ylabel('Count')
 
-    plt.subplot(4, 2, 5)
+    plt.subplot(5, 2, 5)
     plt.bar(zoom_dist.keys(), zoom_dist.values())
     plt.title('Zoom Level Distribution')
     plt.xlabel('Zoom Level')
     plt.ylabel('Count')
 
-    plt.subplot(4, 2, 6)
+    plt.subplot(5, 2, 6)
     plt.scatter(bbox_widths, bbox_heights, alpha=0.5)
     plt.title('Bounding Box Dimensions')
     plt.xlabel('Width (pixels)')
     plt.ylabel('Height (pixels)')
 
-    plt.subplot(4, 2, 7)
+    plt.subplot(5, 2, 7)
     plt.hist(landmark_completeness, bins=np.linspace(0, 1, 11), edgecolor='black')
     plt.title('Landmark Visibility Ratio')
     plt.xlabel('Proportion of Visible Landmarks')
     plt.ylabel('Frequency')
 
-    plt.subplot(4, 2, 8)
+    plt.subplot(5, 2, 8)
     plt.bar(style_dist.keys(), style_dist.values())
     plt.title('Style Distribution for T-shirts')
     plt.xlabel('Style ID')
     plt.ylabel('Count')
+    
+    # New plot for landmark lengths distribution
+    plt.subplot(5, 2, 9)
+    if landmark_lengths:
+        bins = range(min(landmark_lengths), max(landmark_lengths) + 2)
+        plt.hist(landmark_lengths, bins=bins, edgecolor='black', align='left')
+        plt.xticks(range(min(landmark_lengths), max(landmark_lengths) + 1, 5))
+    plt.title('Landmark Array Length Distribution')
+    plt.xlabel('Length of Landmarks Array')
+    plt.ylabel('Frequency')
+    plt.grid(True)
     
     plt.tight_layout()
     plt.savefig('datavis/results/short_sleeve_analysis.png')
@@ -123,6 +136,8 @@ def analyze_annotations(annos_dir):
     print(f"Average Bounding Box Size: {np.mean(bbox_widths):.1f}x{np.mean(bbox_heights):.1f} pixels" if bbox_widths else "No boxes")
     print(f"Landmark Visibility: {np.mean(landmark_completeness)*100:.1f}%" if landmark_completeness else "N/A")
     print(f"Dominant Style: Style {max(style_dist, key=style_dist.get) if style_dist else 'N/A'}")
+    print(f"Average Landmark Array Length: {np.mean(landmark_lengths):.1f}" if landmark_lengths else "N/A")
+    print(f"Most Common Landmark Length: {max(set(landmark_lengths), key=landmark_lengths.count) if landmark_lengths else 'N/A'}")
 
 if __name__ == "__main__":
     analyze_annotations('data/train/annos')

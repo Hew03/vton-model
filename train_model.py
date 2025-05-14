@@ -78,7 +78,7 @@ def build_triple_head_model(max_seg_length):
     # Landmark Head
     l = layers.Dense(512, activation='relu')(shared)
     l = layers.Dropout(0.3)(l)
-    lm_output = layers.Dense(60, name='landmarks')(l)
+    lm_output = layers.Dense(75, name='landmarks')(l)
     
     # Segmentation Mask Head
     m = layers.Dense(128, activation='relu')(shared)
@@ -102,6 +102,7 @@ def prepare_dataset(file_pattern, batch_size=32, shuffle=True):
     if shuffle:
         dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
     
+    dataset = dataset.repeat()  # Add repeat() to prevent running out of data
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 def train_model():
@@ -115,9 +116,15 @@ def train_model():
     model = build_triple_head_model(max_seg_length=MAX_SEG_LENGTH)
     model.summary()
     
+    # Learning rate schedule
+    lr_schedule = optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-4,
+        decay_steps=10000,
+        decay_rate=0.9)
+    
     # Compile model
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=1e-3),
+        optimizer=optimizers.Adam(learning_rate=lr_schedule),
         loss={
             'bbox': losses.MeanSquaredError(),
             'segmentation': losses.MeanSquaredError(),
@@ -143,10 +150,14 @@ def train_model():
     val_ds = prepare_dataset('dataset/val.tfrecord*', batch_size=BATCH_SIZE, shuffle=False)
     test_ds = prepare_dataset('dataset/test.tfrecord*', batch_size=BATCH_SIZE, shuffle=False)
     
+    # Calculate steps per epoch
+    train_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/train.tfrecord*')) // BATCH_SIZE
+    val_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/val.tfrecord*')) // BATCH_SIZE
+    
     # Callbacks
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            'best_model.h5',
+            'best_model.keras',  # Changed to .keras format
             save_best_only=True,
             monitor='val_loss',
             mode='min'
@@ -171,12 +182,14 @@ def train_model():
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
+        steps_per_epoch=train_steps,
+        validation_steps=val_steps,
         callbacks=callbacks
     )
     
     # Save final model
-    model.save('final_model.h5')
-    print("Model saved to final_model.h5")
+    model.save('final_model.keras')  # Changed to .keras format
+    print("Model saved to final_model.keras")
     
     # Plot training history
     plt.figure(figsize=(18, 6))
@@ -209,7 +222,8 @@ def train_model():
     
     # Evaluate on test set
     print("\nEvaluating on test set...")
-    test_results = model.evaluate(test_ds)
+    test_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/test.tfrecord*')) // BATCH_SIZE
+    test_results = model.evaluate(test_ds, steps=test_steps)
     print(f"\nTest Results:")
     print(f"Total Loss: {test_results[0]:.4f}")
     print(f"Bbox MAE: {test_results[4]:.4f}")
