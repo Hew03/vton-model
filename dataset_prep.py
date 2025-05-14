@@ -1,137 +1,155 @@
 import os
 import json
-import numpy as np
 import tensorflow as tf
-from skimage.draw import polygon
+import numpy as np
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+import cv2
 
 # Configuration
-IMG_SIZE = (512, 512)
-MAX_PARTS = 6
-MAX_LANDMARKS = 20
-CATEGORY_ID = 1
-DATA_ROOT = 'data'
-OUTPUT_DIR = 'processed_data'
+IMAGE_SIZE = (256, 256)
+CATEGORY_ID = 1  # short sleeve top
+SUBMASK_REQUIRED = 3
+TEST_VAL_RATIO = 0.15
 
-def parse_annotations(data_dir):
-    """Parse annotations and return paths + metadata per item"""
+def load_and_filter_annotations(image_dir, annos_dir):
+    """Load annotations and filter for short sleeve tops with 3 submasks."""
     samples = []
-    ann_dir = os.path.join(data_dir, 'annos')
-    image_dir = os.path.join(data_dir, 'image')
+    annotation_files = [f for f in os.listdir(annos_dir) if f.endswith('.json')]
     
-    for fname in tqdm(os.listdir(ann_dir)):
-        if not fname.endswith('.json'):
-            continue
-            
-        img_id = fname.split('.')[0]
-        img_path = os.path.join(image_dir, f"{img_id}.jpg")
-        
-        with open(os.path.join(ann_dir, fname), 'r') as f:
+    for filename in tqdm(annotation_files, desc="Processing annotations"):
+        with open(os.path.join(annos_dir, filename), 'r') as f:
             data = json.load(f)
-            tshirt_items = [
-                (key, item) for key, item in data.items()
-                if key.startswith('item') and item['category_id'] == CATEGORY_ID
-            ]
+            image_path = os.path.join(image_dir, filename.replace('.json', '.jpg'))
             
-            for key, _ in tshirt_items:
-                samples.append({
-                    'img_path': img_path,
-                    'img_id': img_id,
-                    'item_key': key
-                })
-    
+            for key in data:
+                if not key.startswith('item'):
+                    continue
+                item = data[key]
+                if item['category_id'] == CATEGORY_ID and len(item['segmentation']) == SUBMASK_REQUIRED:
+                    samples.append({
+                        'image_path': image_path,
+                        'bbox': item['bounding_box'],
+                        'scale': item['scale'],
+                        'viewpoint': item['viewpoint'],
+                        'zoom_in': item['zoom_in'],
+                        'occlusion': item['occlusion'],
+                        'style': item['style'],
+                        'source': 1 if data['source'] == 'shop' else 0,
+                        'segmentation': item['segmentation'],
+                        'landmarks': item['landmarks']
+                    })
     return samples
 
-def create_part_masks(segmentation, img_width, img_height):
-    """Create multi-channel mask for t-shirt parts"""
-    mask = np.zeros((img_height, img_width, MAX_PARTS), dtype=np.float32)
-    for part_idx, poly_group in enumerate(segmentation[:MAX_PARTS]):
-        for poly in poly_group:
-            if len(poly) >= 6:
-                rr, cc = polygon(np.array(poly[1::2]), np.array(poly[0::2]))
-                valid = (rr < img_height) & (cc < img_width)
-                mask[rr[valid], cc[valid], part_idx] = 1.0
-    return mask
+def compute_max_seg_length(samples):
+    """Calculate maximum segmentation length across all samples."""
+    all_seg_lengths = []
+    for sample in samples:
+        seg_length = sum(len(submask) for submask in sample['segmentation'])
+        all_seg_lengths.append(seg_length)
+    return max(all_seg_lengths)
 
-def process_landmarks(landmarks, img_width, img_height):
-    """Normalize and pad landmarks with visibility mask"""
-    coords = []
-    vis_mask = []
+def process_sample(sample, max_seg_length):
+    """Process a single sample into normalized features/targets with padding."""
+    # Load image and get dimensions
+    img = cv2.imread(sample['image_path'])
+    img_height, img_width = img.shape[:2]
     
-    for i in range(0, len(landmarks), 3):
-        x, y, v = landmarks[i], landmarks[i+1], landmarks[i+2]
-        if v > 0 and x < img_width and y < img_height:
-            coords.extend([x/img_width, y/img_height])
-            vis_mask.append(1.0)
-        else:
-            coords.extend([0.0, 0.0])
-            vis_mask.append(0.0)
+    # Normalize bounding box
+    x1, y1, x2, y2 = sample['bbox']
+    bbox_norm = [
+        x1 / img_width, y1 / img_height,
+        x2 / img_width, y2 / img_height
+    ]
     
-    # Pad to MAX_LANDMARKS*2
-    pad_len = MAX_LANDMARKS*2 - len(coords)
-    return (
-        np.array(coords + [0.0]*pad_len, dtype=np.float32),
-        np.array(vis_mask + [0.0]*pad_len, dtype=np.float32)
+    # Crop and resize image patch
+    crop = img[int(y1):int(y2), int(x1):int(x2)]
+    crop = cv2.resize(crop, IMAGE_SIZE) / 255.0
+    
+    # Flatten and normalize segmentation
+    flattened_seg = []
+    for submask in sample['segmentation']:
+        flattened_seg.extend(submask)
+    flattened_seg = np.array(flattened_seg, dtype=np.float32)
+    flattened_seg[::2] /= img_width   # x coordinates
+    flattened_seg[1::2] /= img_height  # y coordinates
+    
+    # Pad segmentation and create mask
+    padded_seg = np.zeros(max_seg_length, dtype=np.float32)
+    padded_seg[:len(flattened_seg)] = flattened_seg
+    seg_mask = np.zeros(max_seg_length, dtype=np.float32)
+    seg_mask[:len(flattened_seg)] = 1.0  # 1 for valid points
+    
+    # Normalize landmarks (fixed length)
+    landmarks = np.array(sample['landmarks'], dtype=np.float32)
+    landmarks[::3] /= img_width   # x
+    landmarks[1::3] /= img_height # y
+    
+    # One-hot encode categorical features
+    categorical_features = [
+        sample['scale'] - 1,
+        sample['viewpoint'] - 1,
+        sample['zoom_in'] - 1,
+        sample['occlusion'] - 1,
+        sample['style']
+    ]
+    cat_encoded = tf.keras.utils.to_categorical(categorical_features, num_classes=[3, 3, 3, 3, 10])
+    
+    return {
+        'image_patch': crop,
+        'bbox': bbox_norm,
+        'source': sample['source'],
+        'categorical': np.concatenate(cat_encoded),
+        'segmentation': padded_seg,
+        'seg_mask': seg_mask,
+        'landmarks': landmarks
+    }
+
+def create_tfrecord(dataset, output_path):
+    """Serialize dataset into TFRecord format with segmentation mask."""
+    with tf.io.TFRecordWriter(output_path) as writer:
+        for data in dataset:
+            # Serialize data
+            image_patch = tf.io.serialize_tensor(data['image_patch']).numpy()
+            bbox = tf.io.serialize_tensor(data['bbox']).numpy()
+            categorical = tf.io.serialize_tensor(data['categorical']).numpy()
+            source = tf.io.serialize_tensor([data['source']]).numpy()
+            segmentation = tf.io.serialize_tensor(data['segmentation']).numpy()
+            seg_mask = tf.io.serialize_tensor(data['seg_mask']).numpy()
+            landmarks = tf.io.serialize_tensor(data['landmarks']).numpy()
+            
+            # Create TFExample
+            example = tf.train.Example(features=tf.train.Features(feature={
+                'image_patch': tf.train.Feature(bytes_list=tf.train.BytesList(value=[image_patch])),
+                'bbox': tf.train.Feature(bytes_list=tf.train.BytesList(value=[bbox])),
+                'categorical': tf.train.Feature(bytes_list=tf.train.BytesList(value=[categorical])),
+                'source': tf.train.Feature(bytes_list=tf.train.BytesList(value=[source])),
+                'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[segmentation])),
+                'seg_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[seg_mask])),
+                'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[landmarks]))
+            }))
+            writer.write(example.SerializeToString())
+
+def main():
+    # Load and filter data
+    samples = load_and_filter_annotations(
+        image_dir='data/train/image',
+        annos_dir='data/train/annos'
     )
+    max_seg_length = compute_max_seg_length(samples)
+    
+    # Process samples with padding
+    processed = [process_sample(s, max_seg_length) for s in tqdm(samples, desc="Processing samples")]
+    
+    # Split into train/test/val
+    train, test_val = train_test_split(processed, test_size=TEST_VAL_RATIO*2, random_state=42)
+    test, val = train_test_split(test_val, test_size=0.5, random_state=42)
+    
+    # Create TFRecords
+    os.makedirs('dataset', exist_ok=True)
+    create_tfrecord(train, 'dataset/train.tfrecord')
+    create_tfrecord(test, 'dataset/test.tfrecord')
+    create_tfrecord(val, 'dataset/val.tfrecord')
 
-def process_sample(sample):
-    """Process single sample"""
-    # Load annotation
-    img_id = sample['img_id'].numpy().decode('utf-8')
-    item_key = sample['item_key'].numpy().decode('utf-8')
-    ann_path = os.path.join(DATA_ROOT, 'train', 'annos', f"{img_id}.json")
-    
-    with open(ann_path, 'r') as f:
-        data = json.load(f)
-        item = data[item_key]
-        seg = item['segmentation']
-        landmarks = item['landmarks']
-    
-    # Load image
-    image = tf.image.decode_jpeg(tf.io.read_file(sample['img_path']), channels=3)
-    orig_h = tf.shape(image)[0]
-    orig_w = tf.shape(image)[1]
-    
-    # Process masks
-    mask = create_part_masks(seg, orig_w, orig_h)
-    
-    # Process landmarks
-    coords, vis_mask = process_landmarks(landmarks, orig_w, orig_h)
-    
-    # Resize and normalize
-    image = tf.image.resize(image, IMG_SIZE) / 255.0
-    mask = tf.image.resize(mask, IMG_SIZE)
-    landmarks_tensor = tf.convert_to_tensor(coords, dtype=tf.float32)
-    vis_masks_tensor = tf.convert_to_tensor(vis_mask, dtype=tf.float32)
-    
-    return image, (mask, landmarks_tensor, vis_masks_tensor)
-
-# Create dataset from paths and metadata
-all_samples = parse_annotations(os.path.join(DATA_ROOT, 'train'))
-train_val, test = train_test_split(all_samples, test_size=0.15, random_state=42)
-train, val = train_test_split(train_val, test_size=0.2, random_state=42)
-
-# Convert to TensorFlow dataset
-def create_dataset(samples):
-    return tf.data.Dataset.from_tensor_slices({
-        'img_path': [s['img_path'] for s in samples],
-        'img_id': [s['img_id'] for s in samples],
-        'item_key': [s['item_key'] for s in samples]
-    }).map(
-        lambda x: tf.py_function(
-            process_sample, [x],
-            (tf.float32, (tf.float32, tf.float32, tf.float32))),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-
-# Create and save datasets
-train_ds = create_dataset(train).shuffle(1000).batch(8).prefetch(tf.data.AUTOTUNE)
-val_ds = create_dataset(val).batch(8).prefetch(tf.data.AUTOTUNE)
-test_ds = create_dataset(test).batch(8).prefetch(tf.data.AUTOTUNE)
-
-# Save datasets
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-tf.data.Dataset.save(train_ds, os.path.join(OUTPUT_DIR, 'train'))
-tf.data.Dataset.save(val_ds, os.path.join(OUTPUT_DIR, 'val'))
-tf.data.Dataset.save(test_ds, os.path.join(OUTPUT_DIR, 'test'))
+if __name__ == "__main__":
+    main()
