@@ -3,13 +3,14 @@ from tensorflow.keras import layers, models, losses, metrics, optimizers
 from tensorflow.keras.applications import EfficientNetB4
 import matplotlib.pyplot as plt
 import os
+import json
 
 # Configuration
 IMG_SIZE = (256, 256)
-BATCH_SIZE = 32
+BATCH_SIZE = 64  # Increased batch size
 EPOCHS = 100
 SEED = 42
-MAX_SEG_LENGTH = 812  # Matches value from dataset_prep.py
+MAX_SEG_LENGTH = 812  # Ensure this matches dataset_prep.py
 
 def parse_tfrecord(example):
     feature_description = {
@@ -33,6 +34,9 @@ def parse_tfrecord(example):
     landmarks.set_shape([landmarks.shape[0]])
     seg_mask.set_shape([MAX_SEG_LENGTH])
     
+    # Ensure seg_mask is binary (0 or 1)
+    seg_mask = tf.math.round(seg_mask)
+    
     return (image, {
         'bbox': bbox,
         'segmentation': segmentation,
@@ -51,10 +55,8 @@ def build_data_augmentation():
 def build_triple_head_model(max_seg_length):
     inputs = layers.Input(shape=(*IMG_SIZE, 3), name='image_input')
     
-    # Data augmentation
     augmented = build_data_augmentation()(inputs)
     
-    # Base model
     base_model = EfficientNetB4(
         input_shape=(*IMG_SIZE, 3),
         include_top=False,
@@ -63,7 +65,6 @@ def build_triple_head_model(max_seg_length):
     base_model.trainable = False
     x = base_model(augmented)
     
-    # Shared features
     shared = layers.GlobalAveragePooling2D()(x)
     
     # Bounding Box Head
@@ -91,40 +92,53 @@ def build_triple_head_model(max_seg_length):
         'landmarks': lm_output
     })
 
-def prepare_dataset(file_pattern, batch_size=32, shuffle=True):
-    files = tf.data.Dataset.list_files(file_pattern)
+def prepare_dataset(file_pattern, batch_size=32, shuffle=True, repeat=True):
+    files = tf.data.Dataset.list_files(file_pattern, shuffle=shuffle)
     dataset = files.interleave(
         lambda x: tf.data.TFRecordDataset(x).map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE),
-        cycle_length=4,
-        num_parallel_calls=tf.data.AUTOTUNE
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False
     )
     
     if shuffle:
-        dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
+        dataset = dataset.shuffle(buffer_size=10000, seed=SEED)
     
-    dataset = dataset.repeat()  # Add repeat() to prevent running out of data
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.batch(batch_size)
+    
+    if repeat:
+        dataset = dataset.repeat()
+    
+    return dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
 def train_model():
-    # Initialize GPU
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         print(f"Using GPU: {gpus[0]}")
         tf.config.experimental.set_memory_growth(gpus[0], True)
     
-    # Build model
+    # Load sample counts
+    with open('dataset/samples_count.json', 'r') as f:
+        counts = json.load(f)
+    train_samples = counts['train']
+    val_samples = counts['val']
+    
+    # Calculate steps
+    train_steps = train_samples // BATCH_SIZE
+    val_steps = val_samples // BATCH_SIZE
+    
     model = build_triple_head_model(max_seg_length=MAX_SEG_LENGTH)
     model.summary()
     
-    # Learning rate schedule
     lr_schedule = optimizers.schedules.ExponentialDecay(
         initial_learning_rate=1e-4,
         decay_steps=10000,
         decay_rate=0.9)
     
-    # Compile model
+    optimizer = optimizers.Adam(learning_rate=lr_schedule)
+    
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=lr_schedule),
+        optimizer=optimizer,
         loss={
             'bbox': losses.MeanSquaredError(),
             'segmentation': losses.MeanSquaredError(),
@@ -140,24 +154,18 @@ def train_model():
         metrics={
             'bbox': ['mae'],
             'segmentation': ['mae'],
-            'seg_mask': ['accuracy'],
+            'seg_mask': ['binary_accuracy'],
             'landmarks': ['mae']
         }
     )
     
-    # Prepare datasets
     train_ds = prepare_dataset('dataset/train.tfrecord*', batch_size=BATCH_SIZE)
     val_ds = prepare_dataset('dataset/val.tfrecord*', batch_size=BATCH_SIZE, shuffle=False)
-    test_ds = prepare_dataset('dataset/test.tfrecord*', batch_size=BATCH_SIZE, shuffle=False)
+    test_ds = prepare_dataset('dataset/test.tfrecord*', batch_size=BATCH_SIZE, shuffle=False, repeat=False)
     
-    # Calculate steps per epoch
-    train_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/train.tfrecord*')) // BATCH_SIZE
-    val_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/val.tfrecord*')) // BATCH_SIZE
-    
-    # Callbacks
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            'best_model.keras',  # Changed to .keras format
+            'best_model.keras',
             save_best_only=True,
             monitor='val_loss',
             mode='min'
@@ -176,7 +184,6 @@ def train_model():
         tf.keras.callbacks.TensorBoard(log_dir='./logs')
     ]
     
-    # Train
     print("\nStarting training...")
     history = model.fit(
         train_ds,
@@ -187,48 +194,42 @@ def train_model():
         callbacks=callbacks
     )
     
-    # Save final model
-    model.save('final_model.keras')  # Changed to .keras format
+    model.save('final_model.keras')
     print("Model saved to final_model.keras")
     
-    # Plot training history
     plt.figure(figsize=(18, 6))
     
-    # Loss plot
     plt.subplot(1, 3, 1)
     plt.plot(history.history['loss'], label='Train Loss')
     plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.title('Training and Validation Loss')
+    plt.title('Loss')
     plt.legend()
     
-    # Bbox and Landmark metrics
     plt.subplot(1, 3, 2)
     plt.plot(history.history['bbox_mae'], label='Bbox MAE')
     plt.plot(history.history['landmarks_mae'], label='Landmark MAE')
-    plt.title('Bbox and Landmark Metrics')
+    plt.title('Metrics')
     plt.legend()
     
-    # Segmentation metrics
     plt.subplot(1, 3, 3)
     plt.plot(history.history['segmentation_mae'], label='Seg MAE')
-    plt.plot(history.history['seg_mask_accuracy'], label='Seg Mask Accuracy')
-    plt.title('Segmentation Metrics')
+    plt.plot(history.history['seg_mask_binary_accuracy'], label='Seg Mask Acc')  # Updated metric name
+    plt.title('Segmentation')
     plt.legend()
     
     plt.tight_layout()
     plt.savefig('training_metrics.png')
     plt.close()
-    print("Training metrics saved to training_metrics.png")
     
-    # Evaluate on test set
+    # Evaluate test set
+    test_samples = counts['test']
+    test_steps = test_samples // BATCH_SIZE
     print("\nEvaluating on test set...")
-    test_steps = sum(1 for _ in tf.data.TFRecordDataset.list_files('dataset/test.tfrecord*')) // BATCH_SIZE
     test_results = model.evaluate(test_ds, steps=test_steps)
-    print(f"\nTest Results:")
-    print(f"Total Loss: {test_results[0]:.4f}")
+    print(f"\nTest Loss: {test_results[0]:.4f}")
     print(f"Bbox MAE: {test_results[4]:.4f}")
     print(f"Segmentation MAE: {test_results[5]:.4f}")
-    print(f"Seg Mask Accuracy: {test_results[6]:.4f}")
+    print(f"Seg Mask Acc: {test_results[6]:.4f}")
     print(f"Landmark MAE: {test_results[7]:.4f}")
     
     return model

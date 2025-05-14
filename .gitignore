@@ -8,3 +8,5 @@
 !/datavis/results/.gitkeep
 
 /logs/*
+
+best_model.keras

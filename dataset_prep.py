@@ -32,7 +32,7 @@ def load_and_filter_annotations(image_dir, annos_dir):
                         continue
                     samples.append({
                         'image_path': image_path,
-                        'bbox': item['bounding_box'],  # Keep original bbox coordinates
+                        'bbox': item['bounding_box'],
                         'segmentation': item['segmentation'],
                         'landmarks': item['landmarks']
                     })
@@ -53,32 +53,28 @@ def process_sample(sample, max_seg_length):
         
         img_height, img_width = img.shape[:2]
         
-        # Resize full image (no cropping)
         full_img = cv2.resize(img, IMAGE_SIZE) / 255.0
         
-        # Convert bbox to normalized [x_center, y_center, width, height] format
         x1, y1, x2, y2 = sample['bbox']
         bbox = np.array([
-            ((x1 + x2)/2 / img_width),    # x_center
-            ((y1 + y2)/2 / img_height),   # y_center
-            (x2 - x1) / img_width,       # width
-            (y2 - y1) / img_height       # height
+            ((x1 + x2)/2 / img_width),
+            ((y1 + y2)/2 / img_height),
+            (x2 - x1) / img_width,
+            (y2 - y1) / img_height
         ], dtype=np.float32)
         
-        # Process segmentation
         flattened_seg = np.concatenate(sample['segmentation']).astype(np.float32)
-        flattened_seg[::2] /= img_width    # Normalize x coordinates
-        flattened_seg[1::2] /= img_height  # Normalize y coordinates
+        flattened_seg[::2] /= img_width
+        flattened_seg[1::2] /= img_height
         
         padded_seg = np.zeros(max_seg_length, dtype=np.float32)
         padded_seg[:len(flattened_seg)] = flattened_seg
         seg_mask = np.zeros(max_seg_length, dtype=np.float32)
         seg_mask[:len(flattened_seg)] = 1.0
         
-        # Process landmarks
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
-        landmarks[::3] /= img_width       # Normalize x coordinates
-        landmarks[1::3] /= img_height     # Normalize y coordinates
+        landmarks[::3] /= img_width
+        landmarks[1::3] /= img_height
         
         return {
             'image': full_img,
@@ -115,6 +111,7 @@ def create_tfrecord(samples, output_path, max_seg_length):
             writer.write(example.SerializeToString())
             valid_count += 1
     print(f"Saved {valid_count}/{len(samples)} valid samples to {output_path}")
+    return valid_count
 
 def prepare_tfrecord_dataset():
     samples = load_and_filter_annotations(
@@ -141,9 +138,29 @@ def prepare_tfrecord_dataset():
     )
     
     os.makedirs('dataset', exist_ok=True)
-    create_tfrecord(train_samples, 'dataset/train.tfrecord', max_seg_length)
-    create_tfrecord(test_samples, 'dataset/test.tfrecord', max_seg_length)
-    create_tfrecord(val_samples, 'dataset/val.tfrecord', max_seg_length)
+    
+    # Save sample counts
+    counts = {
+        'train': len(train_samples),
+        'val': len(val_samples),
+        'test': len(test_samples)
+    }
+    with open('dataset/samples_count.json', 'w') as f:
+        json.dump(counts, f)
+    
+    # Create TFRecords and get actual counts (in case some samples were skipped)
+    train_count = create_tfrecord(train_samples, 'dataset/train.tfrecord', max_seg_length)
+    test_count = create_tfrecord(test_samples, 'dataset/test.tfrecord', max_seg_length)
+    val_count = create_tfrecord(val_samples, 'dataset/val.tfrecord', max_seg_length)
+    
+    # Update counts with actual valid samples
+    counts.update({
+        'train': train_count,
+        'test': test_count,
+        'val': val_count
+    })
+    with open('dataset/samples_count.json', 'w') as f:
+        json.dump(counts, f)
 
 if __name__ == "__main__":
     prepare_tfrecord_dataset()
