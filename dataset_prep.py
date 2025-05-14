@@ -10,6 +10,7 @@ IMAGE_SIZE = (256, 256)
 CATEGORY_ID = 1
 SUBMASK_REQUIRED = 3
 TEST_VAL_RATIO = 0.15
+NUM_LANDMARKS = 25
 
 def load_and_filter_annotations(image_dir, annos_dir):
     samples = []
@@ -47,6 +48,7 @@ def process_sample(sample):
         resized_img = cv2.resize(img, IMAGE_SIZE)
         resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
         
+        # Segmentation mask (3 channels)
         seg_mask = np.zeros((IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
         for i, submask in enumerate(sample['segmentation']):
             if not submask:
@@ -62,19 +64,26 @@ def process_sample(sample):
         
         seg_mask = seg_mask.astype(np.float32)
         
+        # Landmarks processing (25 landmarks with visibility)
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
-        lm_mask = (landmarks[2::3] > 0).astype(np.float32)
-        landmarks = landmarks.reshape(-1, 3)[:, :2].flatten()
-        landmarks[::2] /= img_width
-        landmarks[1::2] /= img_height
-
+        landmarks = landmarks.reshape(-1, 3)  # Reshape to (25, 3)
+        
+        # Normalize coordinates
+        landmarks[:, 0] /= img_width   # X coordinates
+        landmarks[:, 1] /= img_height  # Y coordinates
+        
+        # Create visibility mask (1 for visible, 0 for invisible)
+        lm_mask = (landmarks[:, 2] > 0).astype(np.float32)
+        landmarks = landmarks[:, :2].flatten()  # Flatten to 50 values (25x2)
+        
+        # Encode image
         _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         
         return {
             'image': encoded_img.tobytes(),
-            'segmentation': seg_mask.tobytes(),
-            'landmarks': landmarks.astype(np.float32).tobytes(),
-            'lm_mask': lm_mask.astype(np.float32).tobytes()
+            'segmentation': tf.io.serialize_tensor(tf.convert_to_tensor(seg_mask)).numpy(),
+            'landmarks': tf.io.serialize_tensor(tf.convert_to_tensor(landmarks)).numpy(),
+            'lm_mask': tf.io.serialize_tensor(tf.convert_to_tensor(lm_mask)).numpy()
         }
     except Exception as e:
         print(f"Skipping sample {sample['image_path']}: {str(e)}")
