@@ -6,3 +6,5 @@
 
 /datavis/results/*
 !/datavis/results/.gitkeep
+
+/logs/*
