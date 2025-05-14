@@ -38,84 +38,61 @@ def load_and_filter_annotations(image_dir, annos_dir):
                     })
     return samples
 
-def compute_max_seg_length(samples):
-    all_seg_lengths = []
-    for sample in samples:
-        seg_length = sum(len(submask) for submask in sample['segmentation'])
-        all_seg_lengths.append(seg_length)
-    return max(all_seg_lengths) if all_seg_lengths else 0
-
-def process_sample(sample, max_seg_length):
+def process_sample(sample):
     try:
         img = cv2.imread(sample['image_path'])
         if img is None:
             raise ValueError(f"Failed to load image: {sample['image_path']}")
-        
         img_height, img_width = img.shape[:2]
-        
         resized_img = cv2.resize(img, IMAGE_SIZE)
         resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
         
-        _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        jpeg_bytes = encoded_img.tobytes()
+        seg_mask = np.zeros((IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
+        for i, submask in enumerate(sample['segmentation']):
+            if not submask:
+                continue
+
+            poly = np.array(submask, dtype=np.float32).reshape(-1, 2)
+            poly[:, 0] *= (IMAGE_SIZE[1] / img_width)
+            poly[:, 1] *= (IMAGE_SIZE[0] / img_height)
+            
+            temp_mask = np.zeros(IMAGE_SIZE, dtype=np.uint8)
+            cv2.fillPoly(temp_mask, [poly.astype(np.int32)], color=1)
+            seg_mask[:, :, i] = temp_mask
         
-        x1, y1, x2, y2 = sample['bbox']
-        bbox = np.array([
-            ((x1 + x2)/2 / img_width),
-            ((y1 + y2)/2 / img_height),
-            (x2 - x1) / img_width,
-            (y2 - y1) / img_height
-        ], dtype=np.float32)
-        
-        flattened_seg = np.concatenate(sample['segmentation']).astype(np.float32)
-        flattened_seg[::2] /= img_width
-        flattened_seg[1::2] /= img_height
-        
-        padded_seg = np.zeros(max_seg_length, dtype=np.float32)
-        padded_seg[:len(flattened_seg)] = flattened_seg
-        seg_mask = np.zeros(max_seg_length, dtype=np.float32)
-        seg_mask[:len(flattened_seg)] = 1.0
+        seg_mask = seg_mask.astype(np.float32)
         
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
         lm_mask = (landmarks[2::3] > 0).astype(np.float32)
-        landmarks[::3] /= img_width
-        landmarks[1::3] /= img_height
-        landmarks[::3] *= lm_mask
-        landmarks[1::3] *= lm_mask
+        landmarks = landmarks.reshape(-1, 3)[:, :2].flatten()
+        landmarks[::2] /= img_width
+        landmarks[1::2] /= img_height
+
+        _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         
         return {
-            'image': jpeg_bytes,
-            'bbox': bbox,
-            'segmentation': padded_seg,
-            'seg_mask': seg_mask,
-            'landmarks': landmarks,
-            'lm_mask': lm_mask
+            'image': encoded_img.tobytes(),
+            'segmentation': seg_mask.tobytes(),
+            'landmarks': landmarks.astype(np.float32).tobytes(),
+            'lm_mask': lm_mask.astype(np.float32).tobytes()
         }
     except Exception as e:
         print(f"Skipping sample {sample['image_path']}: {str(e)}")
         return None
 
-def create_tfrecord(samples, output_path, max_seg_length):
+def create_tfrecord(samples, output_path):
     valid_count = 0
     with tf.io.TFRecordWriter(output_path) as writer:
         for sample in tqdm(samples, desc=f"Creating {output_path}"):
-            processed = process_sample(sample, max_seg_length)
+            processed = process_sample(sample)
             if processed is None:
                 continue
                 
-            bbox = tf.io.serialize_tensor(tf.cast(processed['bbox'], tf.float32)).numpy()
-            segmentation = tf.io.serialize_tensor(tf.cast(processed['segmentation'], tf.float32)).numpy()
-            seg_mask = tf.io.serialize_tensor(tf.cast(processed['seg_mask'], tf.float32)).numpy()
-            landmarks = tf.io.serialize_tensor(tf.cast(processed['landmarks'], tf.float32)).numpy()
-            lm_mask = tf.io.serialize_tensor(tf.cast(processed['lm_mask'], tf.float32)).numpy()
-            
             example = tf.train.Example(features=tf.train.Features(feature={
                 'image': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['image']])),
-                'bbox': tf.train.Feature(bytes_list=tf.train.BytesList(value=[bbox])),
-                'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[segmentation])),
-                'seg_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[seg_mask])),
-                'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[landmarks])),
-                'lm_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[lm_mask]))
+                'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['segmentation']])),
+                'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['landmarks']])),
+                'lm_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['lm_mask']]))
             }))
             writer.write(example.SerializeToString())
             valid_count += 1
@@ -127,14 +104,11 @@ def prepare_tfrecord_dataset():
         image_dir='data/train/image',
         annos_dir='data/train/annos'
     )
-    print(f"Found {len(samples)} valid samples after initial filtering")
+    print(f"Found {len(samples)} valid samples")
     
     if not samples:
         raise ValueError("No valid samples found!")
-    
-    max_seg_length = compute_max_seg_length(samples)
-    print(f"Max segmentation length: {max_seg_length}")
-    
+
     train_samples, test_val_samples = train_test_split(
         samples, 
         test_size=TEST_VAL_RATIO*2, 
@@ -147,24 +121,16 @@ def prepare_tfrecord_dataset():
     )
     
     os.makedirs('dataset', exist_ok=True)
+
+    train_count = create_tfrecord(train_samples, 'dataset/train.tfrecord')
+    test_count = create_tfrecord(test_samples, 'dataset/test.tfrecord')
+    val_count = create_tfrecord(val_samples, 'dataset/val.tfrecord')
     
     counts = {
-        'train': len(train_samples),
-        'val': len(val_samples),
-        'test': len(test_samples)
-    }
-    with open('dataset/samples_count.json', 'w') as f:
-        json.dump(counts, f)
-    
-    train_count = create_tfrecord(train_samples, 'dataset/train.tfrecord', max_seg_length)
-    test_count = create_tfrecord(test_samples, 'dataset/test.tfrecord', max_seg_length)
-    val_count = create_tfrecord(val_samples, 'dataset/val.tfrecord', max_seg_length)
-    
-    counts.update({
         'train': train_count,
         'test': test_count,
         'val': val_count
-    })
+    }
     with open('dataset/samples_count.json', 'w') as f:
         json.dump(counts, f)
 
