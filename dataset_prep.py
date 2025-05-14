@@ -53,15 +53,12 @@ def process_sample(sample, max_seg_length):
         
         img_height, img_width = img.shape[:2]
         
-        # Resize and convert to RGB
         resized_img = cv2.resize(img, IMAGE_SIZE)
         resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
         
-        # Encode to JPEG
         _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         jpeg_bytes = encoded_img.tobytes()
         
-        # Bounding box normalization
         x1, y1, x2, y2 = sample['bbox']
         bbox = np.array([
             ((x1 + x2)/2 / img_width),
@@ -70,7 +67,6 @@ def process_sample(sample, max_seg_length):
             (y2 - y1) / img_height
         ], dtype=np.float32)
         
-        # Segmentation processing
         flattened_seg = np.concatenate(sample['segmentation']).astype(np.float32)
         flattened_seg[::2] /= img_width
         flattened_seg[1::2] /= img_height
@@ -80,17 +76,20 @@ def process_sample(sample, max_seg_length):
         seg_mask = np.zeros(max_seg_length, dtype=np.float32)
         seg_mask[:len(flattened_seg)] = 1.0
         
-        # Landmarks processing
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
+        lm_mask = (landmarks[2::3] > 0).astype(np.float32)
         landmarks[::3] /= img_width
         landmarks[1::3] /= img_height
+        landmarks[::3] *= lm_mask
+        landmarks[1::3] *= lm_mask
         
         return {
             'image': jpeg_bytes,
             'bbox': bbox,
             'segmentation': padded_seg,
             'seg_mask': seg_mask,
-            'landmarks': landmarks
+            'landmarks': landmarks,
+            'lm_mask': lm_mask
         }
     except Exception as e:
         print(f"Skipping sample {sample['image_path']}: {str(e)}")
@@ -108,13 +107,15 @@ def create_tfrecord(samples, output_path, max_seg_length):
             segmentation = tf.io.serialize_tensor(tf.cast(processed['segmentation'], tf.float32)).numpy()
             seg_mask = tf.io.serialize_tensor(tf.cast(processed['seg_mask'], tf.float32)).numpy()
             landmarks = tf.io.serialize_tensor(tf.cast(processed['landmarks'], tf.float32)).numpy()
+            lm_mask = tf.io.serialize_tensor(tf.cast(processed['lm_mask'], tf.float32)).numpy()
             
             example = tf.train.Example(features=tf.train.Features(feature={
                 'image': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['image']])),
                 'bbox': tf.train.Feature(bytes_list=tf.train.BytesList(value=[bbox])),
                 'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[segmentation])),
                 'seg_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[seg_mask])),
-                'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[landmarks]))
+                'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[landmarks])),
+                'lm_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[lm_mask]))
             }))
             writer.write(example.SerializeToString())
             valid_count += 1

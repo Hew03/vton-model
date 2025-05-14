@@ -15,7 +15,7 @@ def analyze_annotations(annos_dir):
     bbox_widths = []
     bbox_heights = []
     landmark_completeness = []
-    landmark_lengths = []  # New list to store landmark lengths
+    landmark_lengths = []
 
     annotation_files = [f for f in os.listdir(annos_dir) if f.endswith('.json')]
     
@@ -52,9 +52,9 @@ def analyze_annotations(annos_dir):
                 total_landmarks = len(landmarks) // 3
                 visible_landmarks = sum(1 for i in range(0, len(landmarks), 3) if landmarks[i+2] == 1)
                 landmark_completeness.append(visible_landmarks / total_landmarks if total_landmarks > 0 else 0)
-                landmark_lengths.append(len(landmarks))  # Record the length of landmarks array
+                landmark_lengths.append(len(landmarks))
 
-    plt.figure(figsize=(20, 30))  # Increased figure height to accommodate new plot
+    plt.figure(figsize=(20, 30))
 
     plt.subplot(5, 2, 1)
     if submask_counts['short sleeve top']:
@@ -113,7 +113,6 @@ def analyze_annotations(annos_dir):
     plt.xlabel('Style ID')
     plt.ylabel('Count')
     
-    # New plot for landmark lengths distribution
     plt.subplot(5, 2, 9)
     if landmark_lengths:
         bins = range(min(landmark_lengths), max(landmark_lengths) + 2)

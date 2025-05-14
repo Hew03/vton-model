@@ -17,32 +17,35 @@ def parse_tfrecord(example):
         'bbox': tf.io.FixedLenFeature([], tf.string),
         'segmentation': tf.io.FixedLenFeature([], tf.string),
         'landmarks': tf.io.FixedLenFeature([], tf.string),
-        'seg_mask': tf.io.FixedLenFeature([], tf.string)
+        'seg_mask': tf.io.FixedLenFeature([], tf.string),
+        'lm_mask': tf.io.FixedLenFeature([], tf.string)
     }
     parsed = tf.io.parse_single_example(example, feature_description)
     
-    # Decode and normalize image
     image = tf.io.decode_jpeg(parsed['image'], channels=3)
     image.set_shape([*IMG_SIZE, 3])
     
-    # Parse other features
     bbox = tf.io.parse_tensor(parsed['bbox'], tf.float32)
     segmentation = tf.io.parse_tensor(parsed['segmentation'], tf.float32)
     landmarks = tf.io.parse_tensor(parsed['landmarks'], tf.float32)
     seg_mask = tf.io.parse_tensor(parsed['seg_mask'], tf.float32)
+    lm_mask = tf.io.parse_tensor(parsed['lm_mask'], tf.float32)
     
     bbox.set_shape([4])
     segmentation.set_shape([MAX_SEG_LENGTH])
     landmarks.set_shape([landmarks.shape[0]])
     seg_mask.set_shape([MAX_SEG_LENGTH])
+    lm_mask.set_shape([lm_mask.shape[0]])
     
     seg_mask = tf.math.round(seg_mask)
+    lm_mask = tf.math.round(lm_mask)
     
     return (image, {
         'bbox': bbox,
         'segmentation': segmentation,
         'seg_mask': seg_mask,
-        'landmarks': landmarks
+        'landmarks': landmarks,
+        'lm_mask': lm_mask
     })
 
 def build_data_augmentation():
@@ -68,29 +71,29 @@ def build_triple_head_model(max_seg_length):
     
     shared = layers.GlobalAveragePooling2D()(x)
     
-    # Bounding Box Head
     b = layers.Dense(256, activation='relu')(shared)
     bbox_output = layers.Dense(4, activation='sigmoid', name='bbox')(b)
     
-    # Segmentation Head
     s = layers.Dense(512, activation='relu')(shared)
     s = layers.Dense(256, activation='relu')(s)
     seg_output = layers.Dense(max_seg_length, name='segmentation')(s)
     
-    # Landmark Head
     l = layers.Dense(512, activation='relu')(shared)
     l = layers.Dropout(0.3)(l)
     lm_output = layers.Dense(75, name='landmarks')(l)
     
-    # Segmentation Mask Head
     m = layers.Dense(128, activation='relu')(shared)
     seg_mask_output = layers.Dense(max_seg_length, activation='sigmoid', name='seg_mask')(m)
+    
+    lm_m = layers.Dense(128, activation='relu')(shared)
+    lm_mask_output = layers.Dense(25, activation='sigmoid', name='lm_mask')(lm_m)
     
     return models.Model(inputs=inputs, outputs={
         'bbox': bbox_output,
         'segmentation': seg_output,
         'seg_mask': seg_mask_output,
-        'landmarks': lm_output
+        'landmarks': lm_output,
+        'lm_mask': lm_mask_output
     })
 
 def prepare_dataset(file_pattern, batch_size=32, shuffle=True, repeat=True):
@@ -106,8 +109,7 @@ def prepare_dataset(file_pattern, batch_size=32, shuffle=True, repeat=True):
         dataset = dataset.shuffle(buffer_size=10000, seed=SEED)
     
     dataset = dataset.batch(batch_size)
-    
-    # Convert batch images to float32 and normalize
+
     dataset = dataset.map(
         lambda image, targets: (tf.image.convert_image_dtype(image, tf.float32), targets),
         num_parallel_calls=tf.data.AUTOTUNE
@@ -117,6 +119,18 @@ def prepare_dataset(file_pattern, batch_size=32, shuffle=True, repeat=True):
         dataset = dataset.repeat()
     
     return dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+def masked_landmark_loss(y_true, y_pred):
+    y_true_reshaped = tf.reshape(y_true, [-1, 25, 3])
+    y_pred_reshaped = tf.reshape(y_pred, [-1, 25, 3])
+    
+    true_coords = y_true_reshaped[..., :2]
+    pred_coords = y_pred_reshaped[..., :2]
+    mask = y_true_reshaped[..., 2:]
+    
+    squared_diff = tf.square(true_coords - pred_coords)
+    masked_squared_diff = squared_diff * mask
+    return tf.reduce_mean(masked_squared_diff)
 
 def train_model():
     gpus = tf.config.list_physical_devices('GPU')
@@ -136,29 +150,32 @@ def train_model():
     model.summary()
     
     optimizer = optimizers.Adam(learning_rate=1e-4)
-      
+
     model.compile(
         optimizer=optimizer,
         loss={
             'bbox': losses.MeanSquaredError(),
             'segmentation': losses.MeanSquaredError(),
             'seg_mask': losses.BinaryCrossentropy(),
-            'landmarks': losses.MeanSquaredError()
+            'landmarks': masked_landmark_loss,
+            'lm_mask': losses.BinaryCrossentropy()
         },
         loss_weights={
             'bbox': 0.3,
             'segmentation': 0.3,
-            'seg_mask': 0.2,
-            'landmarks': 0.2
+            'seg_mask': 0.1,
+            'landmarks': 0.2,
+            'lm_mask': 0.1
         },
         metrics={
-            'bbox': ['mae'],
-            'segmentation': ['mae'],
-            'seg_mask': ['binary_accuracy'],
-            'landmarks': ['mae']
+            'bbox': [tf.keras.metrics.MeanAbsoluteError(name='mae')],
+            'segmentation': [tf.keras.metrics.MeanAbsoluteError(name='mae')],
+            'seg_mask': [tf.keras.metrics.BinaryAccuracy(name='acc')],
+            'landmarks': [tf.keras.metrics.MeanAbsoluteError(name='mae')],
+            'lm_mask': [tf.keras.metrics.BinaryAccuracy(name='acc')]
         }
     )
-    
+        
     train_ds = prepare_dataset('dataset/train.tfrecord*', batch_size=BATCH_SIZE)
     val_ds = prepare_dataset('dataset/val.tfrecord*', batch_size=BATCH_SIZE, shuffle=False)
     test_ds = prepare_dataset('dataset/test.tfrecord*', batch_size=BATCH_SIZE, shuffle=False, repeat=False)
@@ -183,7 +200,6 @@ def train_model():
         )
     ]
     
-    # Create output directories if they don't exist
     os.makedirs('output/models', exist_ok=True)
     
     print("\nStarting training...")
@@ -209,15 +225,16 @@ def train_model():
     plt.legend()
     
     plt.subplot(1, 3, 2)
-    plt.plot(history.history['bbox_mae'], label='Bbox MAE')
-    plt.plot(history.history['landmarks_mae'], label='Landmark MAE')
+    plt.plot(history.history['bbox_b_mae'], label='Bbox MAE')
+    plt.plot(history.history['landmarks_lm_mae'], label='Landmark MAE')
     plt.title('Metrics')
     plt.legend()
     
     plt.subplot(1, 3, 3)
-    plt.plot(history.history['segmentation_mae'], label='Seg MAE')
-    plt.plot(history.history['seg_mask_binary_accuracy'], label='Seg Mask Acc')
-    plt.title('Segmentation')
+    plt.plot(history.history['segmentation_s_mae'], label='Seg MAE')
+    plt.plot(history.history['seg_mask_sm_acc'], label='Seg Mask Acc')
+    plt.plot(history.history['lm_mask_lmm_acc'], label='LM Mask Acc', linestyle='--')
+    plt.title('Segmentation & Landmarks')
     plt.legend()
     
     plt.tight_layout()
@@ -228,12 +245,7 @@ def train_model():
     test_steps = test_samples // BATCH_SIZE
     print("\nEvaluating on test set...")
     test_results = model.evaluate(test_ds, steps=test_steps)
-    print(f"\nTest Loss: {test_results[0]:.4f}")
-    print(f"Bbox MAE: {test_results[4]:.4f}")
-    print(f"Segmentation MAE: {test_results[5]:.4f}")
-    print(f"Seg Mask Acc: {test_results[6]:.4f}")
-    print(f"Landmark MAE: {test_results[7]:.4f}")   
-    
+   
     return model
 
 if __name__ == "__main__":
