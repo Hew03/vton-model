@@ -135,13 +135,8 @@ def train_model():
     model = build_triple_head_model(max_seg_length=MAX_SEG_LENGTH)
     model.summary()
     
-    lr_schedule = optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=1e-4,
-        decay_steps=10000,
-        decay_rate=0.9)
-    
-    optimizer = optimizers.Adam(learning_rate=lr_schedule)
-    
+    optimizer = optimizers.Adam(learning_rate=1e-4)
+      
     model.compile(
         optimizer=optimizer,
         loss={
@@ -187,6 +182,9 @@ def train_model():
             monitor='val_loss'
         )
     ]
+    
+    # Create output directories if they don't exist
+    os.makedirs('output/models', exist_ok=True)
     
     print("\nStarting training...")
     history = model.fit(
