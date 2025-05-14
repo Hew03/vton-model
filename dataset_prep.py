@@ -99,11 +99,11 @@ def create_tfrecord(samples, output_path, max_seg_length):
             if processed is None:
                 continue
                 
-            image = tf.io.serialize_tensor(processed['image']).numpy()
-            bbox = tf.io.serialize_tensor(processed['bbox']).numpy()
-            segmentation = tf.io.serialize_tensor(processed['segmentation']).numpy()
-            seg_mask = tf.io.serialize_tensor(processed['seg_mask']).numpy()
-            landmarks = tf.io.serialize_tensor(processed['landmarks']).numpy()
+            image = tf.io.serialize_tensor(tf.cast(processed['image'], tf.float32)).numpy()
+            bbox = tf.io.serialize_tensor(tf.cast(processed['bbox'], tf.float32)).numpy()
+            segmentation = tf.io.serialize_tensor(tf.cast(processed['segmentation'], tf.float32)).numpy()
+            seg_mask = tf.io.serialize_tensor(tf.cast(processed['seg_mask'], tf.float32)).numpy()
+            landmarks = tf.io.serialize_tensor(tf.cast(processed['landmarks'], tf.float32)).numpy()
             
             example = tf.train.Example(features=tf.train.Features(feature={
                 'image': tf.train.Feature(bytes_list=tf.train.BytesList(value=[image])),
