@@ -65,7 +65,7 @@ def analyze_annotations(annos_dir):
     plt.title('Top 5 Category Co-occurrences')
     
     plt.tight_layout()
-    plt.savefig('datavis/results/training_set_analysis.png')
+    plt.savefig('data_vis/results/training_set_analysis.png')
     plt.close()
 
     print("\nSummary Statistics:")

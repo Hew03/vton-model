@@ -4,8 +4,8 @@
 /dataset/*
 !/dataset/.gitkeep
 
-/datavis/results/*
-!/datavis/results/.gitkeep
+/data_vis/results/*
+!/data_vis/results/.gitkeep
 
 /logs/*
 

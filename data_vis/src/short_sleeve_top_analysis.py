@@ -125,7 +125,7 @@ def analyze_annotations(annos_dir):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('datavis/results/short_sleeve_analysis.png')
+    plt.savefig('data_vis/results/short_sleeve_analysis.png')
     plt.close()
 
     print("\nSummary Statistics:")

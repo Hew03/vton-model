@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-def visualize_single_file(annos_dir='data/train/annos', images_dir='data/train/image', output_dir='datavis/results'):
+def visualize_single_file(annos_dir='data/train/annos', images_dir='data/train/image', output_dir='data_vis/results'):
     os.makedirs(output_dir, exist_ok=True)
 
     all_files = [f for f in os.listdir(annos_dir) if f.endswith('.json')]

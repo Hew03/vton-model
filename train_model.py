@@ -5,12 +5,11 @@ import matplotlib.pyplot as plt
 import os
 import json
 
-# Configuration
 IMG_SIZE = (256, 256)
-BATCH_SIZE = 64  # Increased batch size
+BATCH_SIZE = 64
 EPOCHS = 100
 SEED = 42
-MAX_SEG_LENGTH = 812  # Ensure this matches dataset_prep.py
+MAX_SEG_LENGTH = 812
 
 def parse_tfrecord(example):
     feature_description = {
@@ -22,19 +21,21 @@ def parse_tfrecord(example):
     }
     parsed = tf.io.parse_single_example(example, feature_description)
     
-    image = tf.io.parse_tensor(parsed['image'], tf.float32)
+    # Decode and normalize image
+    image = tf.io.decode_jpeg(parsed['image'], channels=3)
+    image.set_shape([*IMG_SIZE, 3])
+    
+    # Parse other features
     bbox = tf.io.parse_tensor(parsed['bbox'], tf.float32)
     segmentation = tf.io.parse_tensor(parsed['segmentation'], tf.float32)
     landmarks = tf.io.parse_tensor(parsed['landmarks'], tf.float32)
     seg_mask = tf.io.parse_tensor(parsed['seg_mask'], tf.float32)
     
-    image.set_shape([*IMG_SIZE, 3])
     bbox.set_shape([4])
     segmentation.set_shape([MAX_SEG_LENGTH])
     landmarks.set_shape([landmarks.shape[0]])
     seg_mask.set_shape([MAX_SEG_LENGTH])
     
-    # Ensure seg_mask is binary (0 or 1)
     seg_mask = tf.math.round(seg_mask)
     
     return (image, {
@@ -106,6 +107,12 @@ def prepare_dataset(file_pattern, batch_size=32, shuffle=True, repeat=True):
     
     dataset = dataset.batch(batch_size)
     
+    # Convert batch images to float32 and normalize
+    dataset = dataset.map(
+        lambda image, targets: (tf.image.convert_image_dtype(image, tf.float32), targets),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    
     if repeat:
         dataset = dataset.repeat()
     
@@ -117,13 +124,11 @@ def train_model():
         print(f"Using GPU: {gpus[0]}")
         tf.config.experimental.set_memory_growth(gpus[0], True)
     
-    # Load sample counts
     with open('dataset/samples_count.json', 'r') as f:
         counts = json.load(f)
     train_samples = counts['train']
     val_samples = counts['val']
     
-    # Calculate steps
     train_steps = train_samples // BATCH_SIZE
     val_steps = val_samples // BATCH_SIZE
     
@@ -165,7 +170,7 @@ def train_model():
     
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            'best_model.keras',
+            'output/models/best_model.keras',
             save_best_only=True,
             monitor='val_loss',
             mode='min'
@@ -180,8 +185,7 @@ def train_model():
             patience=5,
             verbose=1,
             monitor='val_loss'
-        ),
-        tf.keras.callbacks.TensorBoard(log_dir='./logs')
+        )
     ]
     
     print("\nStarting training...")
@@ -191,10 +195,11 @@ def train_model():
         epochs=EPOCHS,
         steps_per_epoch=train_steps,
         validation_steps=val_steps,
-        callbacks=callbacks
+        callbacks=callbacks,
+        verbose=1
     )
     
-    model.save('final_model.keras')
+    model.save('output/models/final_model.keras')
     print("Model saved to final_model.keras")
     
     plt.figure(figsize=(18, 6))
@@ -213,15 +218,14 @@ def train_model():
     
     plt.subplot(1, 3, 3)
     plt.plot(history.history['segmentation_mae'], label='Seg MAE')
-    plt.plot(history.history['seg_mask_binary_accuracy'], label='Seg Mask Acc')  # Updated metric name
+    plt.plot(history.history['seg_mask_binary_accuracy'], label='Seg Mask Acc')
     plt.title('Segmentation')
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('training_metrics.png')
+    plt.savefig('output/training_metrics.png')
     plt.close()
     
-    # Evaluate test set
     test_samples = counts['test']
     test_steps = test_samples // BATCH_SIZE
     print("\nEvaluating on test set...")
@@ -230,7 +234,7 @@ def train_model():
     print(f"Bbox MAE: {test_results[4]:.4f}")
     print(f"Segmentation MAE: {test_results[5]:.4f}")
     print(f"Seg Mask Acc: {test_results[6]:.4f}")
-    print(f"Landmark MAE: {test_results[7]:.4f}")
+    print(f"Landmark MAE: {test_results[7]:.4f}")   
     
     return model
 
