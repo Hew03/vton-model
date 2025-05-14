@@ -32,7 +32,7 @@ def load_and_filter_annotations(image_dir, annos_dir):
                         continue
                     samples.append({
                         'image_path': image_path,
-                        'bbox': item['bounding_box'],
+                        'bbox': item['bounding_box'],  # Keep original bbox coordinates
                         'segmentation': item['segmentation'],
                         'landmarks': item['landmarks']
                     })
@@ -53,34 +53,36 @@ def process_sample(sample, max_seg_length):
         
         img_height, img_width = img.shape[:2]
         
+        # Resize full image (no cropping)
+        full_img = cv2.resize(img, IMAGE_SIZE) / 255.0
+        
+        # Convert bbox to normalized [x_center, y_center, width, height] format
         x1, y1, x2, y2 = sample['bbox']
-        x1, y1 = max(0, int(x1)), max(0, int(y1))
-        x2, y2 = min(img_width, int(x2)), min(img_height, int(y2))
+        bbox = np.array([
+            ((x1 + x2)/2 / img_width),    # x_center
+            ((y1 + y2)/2 / img_height),   # y_center
+            (x2 - x1) / img_width,       # width
+            (y2 - y1) / img_height       # height
+        ], dtype=np.float32)
         
-        if x2 <= x1 or y2 <= y1:
-            raise ValueError(f"Invalid bbox {sample['bbox']} in {sample['image_path']}")
-        
-        crop = img[y1:y2, x1:x2]
-        if crop.size == 0:
-            raise ValueError("Empty crop")
-            
-        crop = cv2.resize(crop, IMAGE_SIZE) / 255.0
-        
+        # Process segmentation
         flattened_seg = np.concatenate(sample['segmentation']).astype(np.float32)
-        flattened_seg[::2] /= img_width
-        flattened_seg[1::2] /= img_height
+        flattened_seg[::2] /= img_width    # Normalize x coordinates
+        flattened_seg[1::2] /= img_height  # Normalize y coordinates
         
         padded_seg = np.zeros(max_seg_length, dtype=np.float32)
         padded_seg[:len(flattened_seg)] = flattened_seg
         seg_mask = np.zeros(max_seg_length, dtype=np.float32)
         seg_mask[:len(flattened_seg)] = 1.0
         
+        # Process landmarks
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
-        landmarks[::3] /= img_width
-        landmarks[1::3] /= img_height
+        landmarks[::3] /= img_width       # Normalize x coordinates
+        landmarks[1::3] /= img_height     # Normalize y coordinates
         
         return {
-            'image_patch': crop,
+            'image': full_img,
+            'bbox': bbox,
             'segmentation': padded_seg,
             'seg_mask': seg_mask,
             'landmarks': landmarks
@@ -97,13 +99,15 @@ def create_tfrecord(samples, output_path, max_seg_length):
             if processed is None:
                 continue
                 
-            image_patch = tf.io.serialize_tensor(processed['image_patch']).numpy()
+            image = tf.io.serialize_tensor(processed['image']).numpy()
+            bbox = tf.io.serialize_tensor(processed['bbox']).numpy()
             segmentation = tf.io.serialize_tensor(processed['segmentation']).numpy()
             seg_mask = tf.io.serialize_tensor(processed['seg_mask']).numpy()
             landmarks = tf.io.serialize_tensor(processed['landmarks']).numpy()
             
             example = tf.train.Example(features=tf.train.Features(feature={
-                'image_patch': tf.train.Feature(bytes_list=tf.train.BytesList(value=[image_patch])),
+                'image': tf.train.Feature(bytes_list=tf.train.BytesList(value=[image])),
+                'bbox': tf.train.Feature(bytes_list=tf.train.BytesList(value=[bbox])),
                 'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[segmentation])),
                 'seg_mask': tf.train.Feature(bytes_list=tf.train.BytesList(value=[seg_mask])),
                 'landmarks': tf.train.Feature(bytes_list=tf.train.BytesList(value=[landmarks]))
