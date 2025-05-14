@@ -245,6 +245,12 @@ def train_model():
     test_steps = test_samples // BATCH_SIZE
     print("\nEvaluating on test set...")
     test_results = model.evaluate(test_ds, steps=test_steps)
+    print(f"\nTest Results:")
+    print(f"Total Loss: {test_results[0]:.4f}")
+    print(f"Bbox MAE: {test_results[4]:.4f}")
+    print(f"Segmentation MAE: {test_results[5]:.4f}")
+    print(f"Seg Mask Accuracy: {test_results[6]:.4f}")
+    print(f"Landmark MAE: {test_results[7]:.4f}")
    
     return model
 
