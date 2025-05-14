@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models, losses, metrics, optimizers
+from tensorflow.keras import layers, models, losses, optimizers
 from tensorflow.keras.applications import EfficientNetB4
 import matplotlib.pyplot as plt
 import os
