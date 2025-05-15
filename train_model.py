@@ -31,48 +31,59 @@ def parse_tfrecord(example):
     
     # Decode landmarks and mask
     landmarks = tf.io.parse_tensor(example['landmarks'], tf.float32)
-    lm_mask = tf.io.parse_tensor(example['lm_mask'], tf.float32)
     landmarks = tf.reshape(landmarks, (LANDMARK_POINTS * 2,))
     
-    return image, {'segmentation_output': segmentation, 'landmark_output': landmarks}, {'lm_mask': lm_mask}
+    lm_mask = tf.io.parse_tensor(example['lm_mask'], tf.float32)
+    lm_mask = tf.reshape(lm_mask, (LANDMARK_POINTS * 2,))
+    
+    # Return with a sample weight dictionary
+    return image, {
+        'segmentation_output': segmentation,
+        'landmark_output': landmarks
+    }, {
+        'segmentation_output': tf.ones((256, 256, 3)),  # use weights of 1.0
+        'landmark_output': lm_mask                     # custom mask
+    }
+
 
 def augment_data(image, labels, sample_weight):
-    # Random horizontal flip (must flip both image and landmarks/masks)
+    seg = labels['segmentation_output']
+    lm = labels['landmark_output']
+
     if tf.random.uniform(()) > 0.5:
         image = tf.image.flip_left_right(image)
-        
-        # Flip segmentation masks and swap left/right sleeve channels
-        seg = labels['segmentation_output']
+
         seg = tf.stack([seg[...,0], seg[...,2], seg[...,1]], axis=-1)
         labels['segmentation_output'] = seg
-        
-        # Flip landmark x coordinates (since we flipped the image)
-        landmarks = labels['landmark_output']
-        landmarks = tf.reshape(landmarks, (LANDMARK_POINTS, 2))
-        landmarks = tf.stack([1.0 - landmarks[:,0], landmarks[:,1]], axis=-1)
-        labels['landmark_output'] = tf.reshape(landmarks, (LANDMARK_POINTS*2,))
+
+        landmarks = tf.reshape(lm, (LANDMARK_POINTS, 2))
+        landmarks = tf.stack([1.0 - landmarks[:, 0], landmarks[:, 1]], axis=-1)
+        labels['landmark_output'] = tf.reshape(landmarks, (LANDMARK_POINTS * 2,))
     
-    # Random brightness/contrast (only affects image)
     image = tf.image.random_brightness(image, 0.1)
     image = tf.image.random_contrast(image, 0.9, 1.1)
-    
+
+    # Re-wrap sample_weight as dict
+    sample_weight = {
+        'segmentation_output': tf.ones_like(labels['segmentation_output']),
+        'landmark_output': tf.ones_like(labels['landmark_output']) * sample_weight['landmark_output']
+    }
+
     return image, labels, sample_weight
 
+
 def create_dataset(filenames, batch_size, augment=False):
-    # Create dataset from TFRecord files with optimized pipeline
     dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
     dataset = dataset.map(parse_tfrecord, num_parallel_calls=AUTOTUNE)
     
     if augment:
         dataset = dataset.map(augment_data, num_parallel_calls=AUTOTUNE)
     
-    # Optimized batching and prefetching
     dataset = dataset.batch(batch_size, drop_remainder=True)
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
 def build_model():
-    # EfficientNet backbone with multi-output heads
     base_model = applications.EfficientNetB4(
         include_top=False,
         weights='imagenet',
@@ -80,23 +91,27 @@ def build_model():
     )
     base_model.trainable = True
     
-    # Segmentation Head (3 output channels)
+    # Segmentation Head
     x = layers.Conv2DTranspose(128, 3, strides=2, padding='same', activation='relu')(base_model.output)
     x = layers.BatchNormalization()(x)
     x = layers.Conv2DTranspose(64, 3, strides=2, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    segmentation_output = layers.Conv2D(3, 3, padding='same', activation='sigmoid', name='segmentation_output')(x)
+    x = layers.Conv2DTranspose(32, 3, strides=2, padding='same', activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2DTranspose(16, 3, strides=2, padding='same', activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    segmentation_output = layers.Conv2D(3, 1, padding='same', activation='sigmoid', name='segmentation_output')(x)
     
-    # Landmark Head (25 points * 2 coordinates)
+    # Landmark Head
     y = layers.GlobalAveragePooling2D()(base_model.output)
     y = layers.Dense(512, activation='relu')(y)
     y = layers.Dropout(0.3)(y)
-    landmark_output = layers.Dense(LANDMARK_POINTS*2, activation='sigmoid', name='landmark_output')(y)
+    landmark_output = layers.Dense(LANDMARK_POINTS * 2, activation='sigmoid', name='landmark_output')(y)
     
-    model = Model(inputs=base_model.input, outputs={
-    'segmentation_output': segmentation_output,
-    'landmark_output': landmark_output
-})
+    model = Model(inputs=base_model.input, outputs=[
+        segmentation_output,
+        landmark_output
+    ])
 
     return model
 
@@ -105,30 +120,16 @@ class MultiTaskLoss(losses.Loss):
         super().__init__()
         self.seg_loss_fn = losses.BinaryCrossentropy()
         self.lm_loss_fn = losses.MeanSquaredError()
-        
-    def call(self, y_true, y_pred, sample_weight=None):
-        # Segmentation loss (standard, no masking)
-        seg_loss = self.seg_loss_fn(
-            y_true['segmentation_output'],
-            y_pred['segmentation_output']
-        )
-        
-        # Landmark loss (masked)
-        lm_true = tf.reshape(y_true['landmark_output'], (-1, LANDMARK_POINTS, 2))
-        lm_pred = tf.reshape(y_pred['landmark_output'], (-1, LANDMARK_POINTS, 2))
-        
-        # Extract mask from sample_weight (passed as the 3rd return value)
-        lm_mask = sample_weight['lm_mask']  # Shape: (batch_size, 25)
-        
-        lm_loss = self.lm_loss_fn(
-            lm_true * tf.expand_dims(lm_mask, -1),
-            lm_pred * tf.expand_dims(lm_mask, -1)
-        )
-        
+
+    def call(self, y_true, y_pred):
+        seg_true, lm_true = y_true
+        seg_pred, lm_pred = y_pred
+        seg_loss = self.seg_loss_fn(seg_true, seg_pred)
+        lm_loss = self.lm_loss_fn(lm_true, lm_pred)
         return seg_loss + lm_loss
 
 def main():
-    # Memory optimization
+    # GPU memory optimization
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         try:
@@ -136,22 +137,24 @@ def main():
         except:
             pass
     
-    # Load datasets with optimized pipeline
+    # Load datasets
     train_files = tf.data.Dataset.list_files('dataset/train.tfrecord')
     val_files = tf.data.Dataset.list_files('dataset/val.tfrecord')
     
     train_ds = create_dataset(train_files, BATCH_SIZE, augment=True)
     val_ds = create_dataset(val_files, BATCH_SIZE)
     
-    # Build model
+    # Build and compile model
     model = build_model()
     
-    # Compile model
     model.compile(
         optimizer=optimizers.Adam(LEARNING_RATE),
-        loss=MultiTaskLoss(),
+        loss={
+            'segmentation_output': losses.BinaryCrossentropy(),
+            'landmark_output': losses.MeanSquaredError()
+        },
         metrics={
-            'segmentation_output': [metrics.BinaryAccuracy(), metrics.MeanIoU(2)],
+            'segmentation_output': [metrics.BinaryAccuracy(), metrics.MeanIoU(num_classes=2)],
             'landmark_output': [metrics.MeanAbsoluteError()]
         }
     )
@@ -178,19 +181,24 @@ def main():
         )
     ]
     
-    # Train with memory-efficient settings
+    for image, labels, weights in train_ds.take(1):
+        print("Sample shapes:")
+        print("  Image:", image.shape)
+        print("  Labels:", {k: v.shape for k, v in labels.items()})
+        print("  Weights:", {k: v.shape for k, v in weights.items()})
+
+    # Training
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
         callbacks=callbacks,
-        verbose=1  # Shows built-in progress bar
+        verbose=1
     )
     
-    # Save final model
+    # Save model and history
     model.save('final_model.h5')
     
-    # Save training history
     with open('training_history.json', 'w') as f:
         json.dump(history.history, f)
 

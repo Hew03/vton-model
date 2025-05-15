@@ -73,8 +73,9 @@ def process_sample(sample):
         
         # Create visibility mask (1 for visible, 0 for invisible)
         lm_mask = (landmarks[:, 2] > 0).astype(np.float32)
+        lm_mask = np.repeat(lm_mask, 2)  # Shape (50,)
         landmarks = landmarks[:, :2].flatten()  # Flatten to 50 values (25x2)
-        
+                
         # Encode image
         _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         
@@ -88,14 +89,16 @@ def process_sample(sample):
         print(f"Skipping sample {sample['image_path']}: {str(e)}")
         return None
 
-def create_tfrecord(samples, output_path):
+def create_tfrecord(samples, output_path, preview_limit=5):
     valid_count = 0
+    preview_samples = []
+    
     with tf.io.TFRecordWriter(output_path) as writer:
         for sample in tqdm(samples, desc=f"Creating {output_path}"):
             processed = process_sample(sample)
             if processed is None:
                 continue
-                
+            
             example = tf.train.Example(features=tf.train.Features(feature={
                 'image': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['image']])),
                 'segmentation': tf.train.Feature(bytes_list=tf.train.BytesList(value=[processed['segmentation']])),
@@ -104,7 +107,29 @@ def create_tfrecord(samples, output_path):
             }))
             writer.write(example.SerializeToString())
             valid_count += 1
+
+            # Collect preview data (convert bytes back to numpy for JSON)
+            if len(preview_samples) < preview_limit:
+                # Deserialize landmarks and lm_mask to lists for JSON
+                landmarks = tf.io.parse_tensor(processed['landmarks'], out_type=tf.float32).numpy().tolist()
+                lm_mask = tf.io.parse_tensor(processed['lm_mask'], out_type=tf.float32).numpy().tolist()
+                
+                preview_samples.append({
+                    'image_path': sample['image_path'],
+                    'landmarks': landmarks,
+                    'lm_mask': lm_mask,
+                    'segmentation_shape': (IMAGE_SIZE[0], IMAGE_SIZE[1], 3)
+                })
+
     print(f"Saved {valid_count}/{len(samples)} valid samples to {output_path}")
+
+    # Save preview JSON
+    preview_path = os.path.splitext(output_path)[0] + '_preview.json'
+    with open(preview_path, 'w') as f:
+        json.dump(preview_samples, f, indent=2)
+
+    print(f"Saved preview JSON for {len(preview_samples)} samples to {preview_path}")
+
     return valid_count
 
 def prepare_tfrecord_dataset():
