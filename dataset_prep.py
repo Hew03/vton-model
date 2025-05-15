@@ -33,7 +33,6 @@ def load_and_filter_annotations(image_dir, annos_dir):
                         continue
                     samples.append({
                         'image_path': image_path,
-                        'bbox': item['bounding_box'],
                         'segmentation': item['segmentation'],
                         'landmarks': item['landmarks']
                     })
