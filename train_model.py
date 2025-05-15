@@ -1,18 +1,16 @@
 import os
 import json
 import tensorflow as tf
-import numpy as np
-from tensorflow import keras
-from tensorflow.keras import layers, Model, Input
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, ReduceLROnPlateau
+import gc
+from tensorflow.keras import layers, Model
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-import matplotlib.pyplot as plt
-from datetime import datetime
+from tensorflow.keras.applications import MobileNetV2
 
 # Constants
 IMAGE_SIZE = (256, 256)
 BATCH_SIZE = 16
-BUFFER_SIZE = 1000
+BUFFER_SIZE = 100
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 NUM_LANDMARKS = 25
@@ -110,7 +108,7 @@ def augment_data(data):
     }
 
 # Create TF Dataset from TFRecords
-def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=True):
+def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=False):
     """Create dataset from TFRecord files."""
     # Check if the file exists
     if not tf.io.gfile.exists(tfrecord_path):
@@ -133,77 +131,48 @@ def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=Tr
     # Shuffle, batch, and prefetch
     dataset = dataset.shuffle(buffer_size=BUFFER_SIZE)
     dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(1)
     
     return dataset
 
-# U-Net blocks for the model
-def conv_block(inputs, filters, kernel_size=3, activation='relu', padding='same', use_bn=True):
-    """Convolutional block with batch normalization."""
-    x = layers.Conv2D(filters, kernel_size, padding=padding)(inputs)
-    if use_bn:
-        x = layers.BatchNormalization()(x)
-    x = layers.Activation(activation)(x)
-    
-    x = layers.Conv2D(filters, kernel_size, padding=padding)(x)
-    if use_bn:
-        x = layers.BatchNormalization()(x)
-    x = layers.Activation(activation)(x)
-    
-    return x
-
-def encoder_block(inputs, filters, kernel_size=3, use_bn=True):
-    """Encoder block: Conv -> MaxPool."""
-    x = conv_block(inputs, filters, kernel_size, use_bn=use_bn)
-    p = layers.MaxPooling2D(pool_size=(2, 2))(x)
-    return x, p
-
-def decoder_block(inputs, skip, filters, kernel_size=3, use_bn=True):
-    """Decoder block: Upsample -> Concat -> Conv."""
-    x = layers.UpSampling2D(size=(2, 2))(inputs)
-    x = layers.Concatenate()([x, skip])
-    x = conv_block(x, filters, kernel_size, use_bn=use_bn)
-    return x
-
 # Build the multi-task U-Net model
-def build_model(input_shape=(256, 256, 3)):
-    """Build a U-Net model with segmentation and landmark heads."""
-    inputs = Input(shape=input_shape)
+def build_finetuning_model(input_shape=(256, 256, 3)):
+    # Load pre-trained MobileNetV2 backbone
+    base_model = MobileNetV2(
+        input_shape=input_shape,
+        include_top=False,
+        weights='imagenet',
+        pooling=None  # Ensure full spatial dimensions are preserved
+    )
     
-    # Encoder
-    e1, p1 = encoder_block(inputs, 64)
-    e2, p2 = encoder_block(p1, 128)
-    e3, p3 = encoder_block(p2, 256)
-    e4, p4 = encoder_block(p3, 512)
+    # Freeze initial layers for fine-tuning
+    for layer in base_model.layers[:100]:
+        layer.trainable = False
     
-    # Bridge
-    b = conv_block(p4, 1024)
+    # Get backbone features (output shape: 8x8x1280)
+    backbone_output = base_model.output
     
-    # Decoder
-    d1 = decoder_block(b, e4, 512)
-    d2 = decoder_block(d1, e3, 256)
-    d3 = decoder_block(d2, e2, 128)
-    d4 = decoder_block(d3, e1, 64)
+    # Segmentation head with progressive upsampling
+    x = layers.Conv2DTranspose(256, (3, 3), strides=2, padding='same')(backbone_output)  # 16x16
+    x = layers.Conv2DTranspose(128, (3, 3), strides=2, padding='same')(x)  # 32x32
+    x = layers.Conv2DTranspose(64, (3, 3), strides=2, padding='same')(x)  # 64x64
+    x = tf.keras.layers.UpSampling2D(size=(4, 4))(x) 
     
-    # Shared features for both tasks
-    shared = layers.Conv2D(64, 3, activation='relu', padding='same')(d4)
+    seg_output = layers.Conv2D(
+        NUM_SEGMENTATION_CHANNELS, 
+        (1, 1), 
+        activation='sigmoid', 
+        name='segmentation'
+    )(x)
     
-    # Segmentation head (3 channel output)
-    seg_head = layers.Conv2D(32, 3, activation='relu', padding='same')(shared)
-    seg_output = layers.Conv2D(NUM_SEGMENTATION_CHANNELS, 1, activation='sigmoid', name='segmentation')(seg_head)
+    # Landmark head (unchanged)
+    y = layers.GlobalAveragePooling2D()(backbone_output)
+    y = layers.Dense(256, activation='relu')(y)
+    y = layers.Dropout(0.3)(y)
+    lm_output = layers.Dense(NUM_LANDMARKS * 2, name='landmarks')(y)
     
-    # Landmark head
-    # Global features for landmarks
-    lm_features = layers.GlobalAveragePooling2D()(shared)
-    lm_features = layers.Dense(512, activation='relu')(lm_features)
-    lm_features = layers.Dropout(0.2)(lm_features)
-    lm_features = layers.Dense(256, activation='relu')(lm_features)
-    lm_output = layers.Dense(NUM_LANDMARKS * 2, name='landmarks')(lm_features)
-    
-    # Create model
-    model = Model(inputs=inputs, outputs=[seg_output, lm_output])
-    
-    return model
+    return Model(inputs=base_model.input, outputs=[seg_output, lm_output])
+
 
 # Custom loss functions
 def masked_mse_loss(lm_mask):
@@ -335,24 +304,26 @@ def main():
     
     # Create datasets
     print("Creating datasets...")
-    train_dataset = create_dataset('dataset/train.tfrecord', augment=True, cache=True)
-    val_dataset = create_dataset('dataset/val.tfrecord', augment=False, cache=True)
+    train_dataset = create_dataset('dataset/train.tfrecord', augment=True, cache=False)
+    val_dataset = create_dataset('dataset/val.tfrecord', augment=False, cache=False)
     test_dataset = create_dataset('dataset/test.tfrecord', augment=False, cache=False)
+
+    gc.collect()
     
     # Build model
     print("Building model...")
-    base_model = build_model(input_shape=(*IMAGE_SIZE, 3))
+    base_model = build_finetuning_model(input_shape=(*IMAGE_SIZE, 3))
     model = GarmentModel(base_model.inputs, base_model.outputs)
     
     # Compile model
     print("Compiling model...")
     model.compile(
         optimizer=Adam(learning_rate=LEARNING_RATE),
-        loss='binary_crossentropy',  # Used for segmentation loss
+        loss='binary_crossentropy',
         metrics=[iou_metric]
     )
     
-    # Print model summary
+    # Model summary
     model.summary()
     
     # Create output directories

@@ -10,3 +10,6 @@
 /logs/*
 
 best_model.keras
+
+*.h5
+*.json
