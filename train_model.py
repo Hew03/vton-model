@@ -11,7 +11,7 @@ from tensorflow.keras.applications import MobileNetV2
 IMAGE_SIZE = (256, 256)
 BATCH_SIZE = 16
 BUFFER_SIZE = 100
-NUM_EPOCHS = 100
+NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 NUM_LANDMARKS = 25
 NUM_SEGMENTATION_CHANNELS = 3
@@ -54,26 +54,6 @@ def parse_tfrecord_fn(example):
         'lm_mask': lm_mask
     }
 
-# Data augmentation functions
-def random_flip_horizontal(image, segmentation, landmarks, lm_mask):
-    """Randomly flip the image, segmentation, and landmarks horizontally."""
-    if tf.random.uniform(()) > 0.5:
-        # Flip image and segmentation
-        image = tf.image.flip_left_right(image)
-        segmentation = tf.image.flip_left_right(segmentation)
-        
-        # Flip landmarks - we need to adjust x coordinates (even indices)
-        x_coords = landmarks[::2]
-        y_coords = landmarks[1::2]
-        
-        # Flip x coordinates (1.0 - x)
-        x_coords = 1.0 - x_coords
-        
-        # Reconstruct landmarks
-        landmarks = tf.reshape(tf.stack([x_coords, y_coords], axis=1), [-1])
-        
-    return image, segmentation, landmarks, lm_mask
-
 def random_brightness_contrast(image, segmentation, landmarks, lm_mask):
     """Apply random brightness and contrast to the image."""
     if tf.random.uniform(()) > 0.5:
@@ -95,9 +75,6 @@ def augment_data(data):
     landmarks = data['landmarks']
     lm_mask = data['lm_mask']
     
-    # Apply augmentations
-    image, segmentation, landmarks, lm_mask = random_flip_horizontal(image, segmentation, landmarks, lm_mask)
-    # Rotation removed due to TF version compatibility issues
     image, segmentation, landmarks, lm_mask = random_brightness_contrast(image, segmentation, landmarks, lm_mask)
     
     return {
@@ -149,15 +126,59 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     for layer in base_model.layers[:100]:
         layer.trainable = False
     
-    # Get backbone features (output shape: 8x8x1280)
-    backbone_output = base_model.output
+    # Extract features at different levels for skip connections
+    # These are the output features from different blocks of MobileNetV2
+    input_image = base_model.input
     
-    # Segmentation head with progressive upsampling
-    x = layers.Conv2DTranspose(256, (3, 3), strides=2, padding='same')(backbone_output)  # 16x16
-    x = layers.Conv2DTranspose(128, (3, 3), strides=2, padding='same')(x)  # 32x32
-    x = layers.Conv2DTranspose(64, (3, 3), strides=2, padding='same')(x)  # 64x64
-    x = tf.keras.layers.UpSampling2D(size=(4, 4))(x) 
+    # Get intermediate features from different blocks for skip connections
+    block_features = []
+    for i, layer in enumerate(base_model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D) and layer.strides == (2, 2):
+            if i > 3:  # Skip the very early layers
+                block_features.append(base_model.layers[i-1].output)
     
+    # Get final backbone features (currently 8x8x1280)
+    x = base_model.output
+    
+    # Upsampling blocks with skip connections for higher resolution
+    # Starting from 8x8 resolution
+    
+    # Upsample to 16x16
+    x = layers.Conv2DTranspose(256, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 0:
+        x = layers.Concatenate()([x, block_features[-1]])
+    
+    # Upsample to 32x32
+    x = layers.Conv2DTranspose(128, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 1:
+        x = layers.Concatenate()([x, block_features[-2]])
+    
+    # Upsample to 64x64
+    x = layers.Conv2DTranspose(64, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 2:
+        x = layers.Concatenate()([x, block_features[-3]])
+    
+    # Upsample to 128x128
+    x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    
+    # Final upsample to 256x256 (full resolution)
+    x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    
+    # Add refinement convolutions to smooth out artifacts
+    x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
+    x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
+    
+    # Final segmentation output
     seg_output = layers.Conv2D(
         NUM_SEGMENTATION_CHANNELS, 
         (1, 1), 
@@ -166,13 +187,12 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     )(x)
     
     # Landmark head (unchanged)
-    y = layers.GlobalAveragePooling2D()(backbone_output)
+    y = layers.GlobalAveragePooling2D()(base_model.output)
     y = layers.Dense(256, activation='relu')(y)
     y = layers.Dropout(0.3)(y)
     lm_output = layers.Dense(NUM_LANDMARKS * 2, name='landmarks')(y)
     
-    return Model(inputs=base_model.input, outputs=[seg_output, lm_output])
-
+    return Model(inputs=input_image, outputs=[seg_output, lm_output])
 
 # Custom loss functions
 def masked_mse_loss(lm_mask):

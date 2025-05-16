@@ -2,6 +2,8 @@ import tensorflow as tf
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from tensorflow.keras import layers, Model
+from tensorflow.keras.applications import MobileNetV2
 
 # Constants
 IMAGE_SIZE = (256, 256)
@@ -10,32 +12,85 @@ NUM_SEGMENTATION_CHANNELS = 3
 
 # Rebuild model architecture
 def build_finetuning_model(input_shape=(256, 256, 3)):
-    base_model = tf.keras.applications.MobileNetV2(
+    # Load pre-trained MobileNetV2 backbone
+    base_model = MobileNetV2(
         input_shape=input_shape,
         include_top=False,
-        weights=None,
-        pooling=None
+        weights='imagenet',
+        pooling=None  # Ensure full spatial dimensions are preserved
     )
     
+    # Freeze initial layers for fine-tuning
     for layer in base_model.layers[:100]:
         layer.trainable = False
     
-    backbone_output = base_model.output
+    # Extract features at different levels for skip connections
+    # These are the output features from different blocks of MobileNetV2
+    input_image = base_model.input
     
-    # Segmentation head
-    x = tf.keras.layers.Conv2DTranspose(256, (3,3), strides=2, padding='same')(backbone_output)
-    x = tf.keras.layers.Conv2DTranspose(128, (3,3), strides=2, padding='same')(x)
-    x = tf.keras.layers.Conv2DTranspose(64, (3,3), strides=2, padding='same')(x)
-    x = tf.keras.layers.UpSampling2D(4)(x)
-    seg_output = tf.keras.layers.Conv2D(NUM_SEGMENTATION_CHANNELS, (1,1), activation='sigmoid', name='segmentation')(x)
+    # Get intermediate features from different blocks for skip connections
+    block_features = []
+    for i, layer in enumerate(base_model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D) and layer.strides == (2, 2):
+            if i > 3:  # Skip the very early layers
+                block_features.append(base_model.layers[i-1].output)
     
-    # Landmark head
-    y = tf.keras.layers.GlobalAveragePooling2D()(backbone_output)
-    y = tf.keras.layers.Dense(256, activation='relu')(y)
-    y = tf.keras.layers.Dropout(0.3)(y)
-    lm_output = tf.keras.layers.Dense(NUM_LANDMARKS*2, name='landmarks')(y)
+    # Get final backbone features (currently 8x8x1280)
+    x = base_model.output
     
-    return tf.keras.Model(inputs=base_model.input, outputs=[seg_output, lm_output])
+    # Upsampling blocks with skip connections for higher resolution
+    # Starting from 8x8 resolution
+    
+    # Upsample to 16x16
+    x = layers.Conv2DTranspose(256, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 0:
+        x = layers.Concatenate()([x, block_features[-1]])
+    
+    # Upsample to 32x32
+    x = layers.Conv2DTranspose(128, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 1:
+        x = layers.Concatenate()([x, block_features[-2]])
+    
+    # Upsample to 64x64
+    x = layers.Conv2DTranspose(64, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    if len(block_features) > 2:
+        x = layers.Concatenate()([x, block_features[-3]])
+    
+    # Upsample to 128x128
+    x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    
+    # Final upsample to 256x256 (full resolution)
+    x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    
+    # Add refinement convolutions to smooth out artifacts
+    x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
+    x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
+    
+    # Final segmentation output
+    seg_output = layers.Conv2D(
+        NUM_SEGMENTATION_CHANNELS, 
+        (1, 1), 
+        activation='sigmoid', 
+        name='segmentation'
+    )(x)
+    
+    # Landmark head (unchanged)
+    y = layers.GlobalAveragePooling2D()(base_model.output)
+    y = layers.Dense(256, activation='relu')(y)
+    y = layers.Dropout(0.3)(y)
+    lm_output = layers.Dense(NUM_LANDMARKS * 2, name='landmarks')(y)
+    
+    return Model(inputs=input_image, outputs=[seg_output, lm_output])
 
 # Load trained weights
 model = build_finetuning_model()
