@@ -59,7 +59,6 @@ def random_brightness_contrast(image, segmentation, landmarks, lm_mask):
     return image, segmentation, landmarks, lm_mask
 
 def augment_data(data):
-    """Apply a series of augmentations to the data."""
     image = data['image']
     segmentation = data['segmentation']
     landmarks = data['landmarks']
@@ -84,12 +83,11 @@ def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=Fa
     dataset = dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
     
     if cache:
-        dataset = dataset.cache() # Its here but i DO NOT RECOMMEND unlsess you have infinite RAM
+        dataset = dataset.cache() # Its here but I DO NOT RECOMMEND unlsess you have infinite RAM
     
     if augment:
         dataset = dataset.map(augment_data, num_parallel_calls=tf.data.AUTOTUNE)
     
-    # Shuffle, batch, and prefetch
     dataset = dataset.shuffle(buffer_size=BUFFER_SIZE)
     dataset = dataset.batch(batch_size)
     dataset = dataset.prefetch(1)
@@ -112,7 +110,7 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     block_features = []
     for i, layer in enumerate(base_model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D) and layer.strides == (2, 2):
-            if i > 3:  # Skip the very early layers
+            if i > 3:
                 block_features.append(base_model.layers[i-1].output)
     
     x = base_model.output
