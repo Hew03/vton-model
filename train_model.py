@@ -186,10 +186,12 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
         name='segmentation'
     )(x)
     
-    # Landmark head (unchanged)
-    y = layers.GlobalAveragePooling2D()(base_model.output)
+    # Example alternative to global average pooling
+    y = layers.Conv2D(64, (3, 3), padding='same')(base_model.output)
+    y = layers.BatchNormalization()(y)
+    y = layers.ReLU()(y)
+    y = layers.Flatten()(y)
     y = layers.Dense(256, activation='relu')(y)
-    y = layers.Dropout(0.3)(y)
     lm_output = layers.Dense(NUM_LANDMARKS * 2, name='landmarks')(y)
     
     return Model(inputs=input_image, outputs=[seg_output, lm_output])
