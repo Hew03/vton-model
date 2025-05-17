@@ -7,7 +7,6 @@ from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.applications import MobileNetV2
 
-# Constants
 IMAGE_SIZE = (256, 256)
 BATCH_SIZE = 16
 BUFFER_SIZE = 100
@@ -16,11 +15,9 @@ LEARNING_RATE = 1e-4
 NUM_LANDMARKS = 25
 NUM_SEGMENTATION_CHANNELS = 3
 
-# Loss weights
 SEGMENTATION_LOSS_WEIGHT = 1.0
-LANDMARK_LOSS_WEIGHT = 10.0  # Higher weight since landmarks are more precise
+LANDMARK_LOSS_WEIGHT = 10.0
 
-# TFRecord parsing functions
 def parse_tfrecord_fn(example):
     feature_description = {
         'image': tf.io.FixedLenFeature([], tf.string),
@@ -31,16 +28,13 @@ def parse_tfrecord_fn(example):
     
     example = tf.io.parse_single_example(example, feature_description)
     
-    # Decode image
     image = tf.io.decode_jpeg(example['image'], channels=3)
-    image = tf.cast(image, tf.float32) / 255.0  # Normalize to [0, 1]
+    image = tf.cast(image, tf.float32) / 255.0
     image = tf.reshape(image, [*IMAGE_SIZE, 3])
     
-    # Decode segmentation mask
     segmentation = tf.io.parse_tensor(example['segmentation'], out_type=tf.float32)
     segmentation = tf.reshape(segmentation, [*IMAGE_SIZE, NUM_SEGMENTATION_CHANNELS])
     
-    # Decode landmarks and landmark mask
     landmarks = tf.io.parse_tensor(example['landmarks'], out_type=tf.float32)
     lm_mask = tf.io.parse_tensor(example['lm_mask'], out_type=tf.float32)
     
@@ -55,15 +49,11 @@ def parse_tfrecord_fn(example):
     }
 
 def random_brightness_contrast(image, segmentation, landmarks, lm_mask):
-    """Apply random brightness and contrast to the image."""
     if tf.random.uniform(()) > 0.5:
-        # Apply brightness
         image = tf.image.random_brightness(image, max_delta=0.1)
         
-        # Apply contrast
         image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
         
-        # Ensure values stay within [0, 1]
         image = tf.clip_by_value(image, 0.0, 1.0)
     
     return image, segmentation, landmarks, lm_mask
@@ -76,6 +66,7 @@ def augment_data(data):
     lm_mask = data['lm_mask']
     
     image, segmentation, landmarks, lm_mask = random_brightness_contrast(image, segmentation, landmarks, lm_mask)
+    # Removed other augmentations, was causing issues
     
     return {
         'image': image,
@@ -84,24 +75,17 @@ def augment_data(data):
         'lm_mask': lm_mask
     }
 
-# Create TF Dataset from TFRecords
 def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=False):
-    """Create dataset from TFRecord files."""
-    # Check if the file exists
     if not tf.io.gfile.exists(tfrecord_path):
         raise FileNotFoundError(f"TFRecord file not found: {tfrecord_path}")
     
-    # Create dataset from TFRecord
     dataset = tf.data.TFRecordDataset(tfrecord_path)
     
-    # Parse examples
     dataset = dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
     
-    # Cache data if requested (speeds up training)
     if cache:
-        dataset = dataset.cache()
+        dataset = dataset.cache() # Its here but i DO NOT RECOMMEND unlsess you have infinite RAM
     
-    # Apply augmentation during training
     if augment:
         dataset = dataset.map(augment_data, num_parallel_calls=tf.data.AUTOTUNE)
     
@@ -112,81 +96,63 @@ def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=Fa
     
     return dataset
 
-# Build the multi-task U-Net model
 def build_finetuning_model(input_shape=(256, 256, 3)):
-    # Load pre-trained MobileNetV2 backbone
     base_model = MobileNetV2(
         input_shape=input_shape,
         include_top=False,
         weights='imagenet',
-        pooling=None  # Ensure full spatial dimensions are preserved
+        pooling=None
     )
     
-    # Freeze initial layers for fine-tuning
     for layer in base_model.layers[:100]:
         layer.trainable = False
-    
-    # Extract features at different levels for skip connections
-    # These are the output features from different blocks of MobileNetV2
+
     input_image = base_model.input
-    
-    # Get intermediate features from different blocks for skip connections
+
     block_features = []
     for i, layer in enumerate(base_model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D) and layer.strides == (2, 2):
             if i > 3:  # Skip the very early layers
                 block_features.append(base_model.layers[i-1].output)
     
-    # Get final backbone features (currently 8x8x1280)
     x = base_model.output
-    
-    # Upsampling blocks with skip connections for higher resolution
-    # Starting from 8x8 resolution
-    
-    # Upsample to 16x16
+
     x = layers.Conv2DTranspose(256, (4, 4), strides=2, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
     if len(block_features) > 0:
         x = layers.Concatenate()([x, block_features[-1]])
-    
-    # Upsample to 32x32
+
     x = layers.Conv2DTranspose(128, (4, 4), strides=2, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
     if len(block_features) > 1:
         x = layers.Concatenate()([x, block_features[-2]])
-    
-    # Upsample to 64x64
+
     x = layers.Conv2DTranspose(64, (4, 4), strides=2, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
     if len(block_features) > 2:
         x = layers.Concatenate()([x, block_features[-3]])
-    
-    # Upsample to 128x128
+
     x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
-    
-    # Final upsample to 256x256 (full resolution)
+
     x = layers.Conv2DTranspose(32, (4, 4), strides=2, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
-    
-    # Add refinement convolutions to smooth out artifacts
+
     x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
     x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
-    
-    # Final segmentation output
+
     seg_output = layers.Conv2D(
         NUM_SEGMENTATION_CHANNELS, 
         (1, 1), 
         activation='sigmoid', 
         name='segmentation'
     )(x)
-    
-    # Example alternative to global average pooling
+
     y = layers.Conv2D(64, (3, 3), padding='same')(base_model.output)
     y = layers.BatchNormalization()(y)
     y = layers.ReLU()(y)
@@ -196,23 +162,17 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     
     return Model(inputs=input_image, outputs=[seg_output, lm_output])
 
-# Custom loss functions
 def masked_mse_loss(lm_mask):
-    """MSE loss that's masked by the landmark visibility mask."""
     def loss(y_true, y_pred):
-        # Apply mask to both true and predicted landmarks
         masked_true = y_true * lm_mask
         masked_pred = y_pred * lm_mask
-        
-        # Compute MSE only on visible landmarks
+
         mse = tf.reduce_sum(tf.square(masked_true - masked_pred)) / (tf.reduce_sum(lm_mask) + tf.keras.backend.epsilon())
         return mse
     return loss
 
-# Custom model wrapper that handles the landmark mask input
 class GarmentModel(Model):
     def train_step(self, data):
-        # Unpack the data
         x = data['image']
         y = {
             'segmentation': data['segmentation'],
@@ -221,34 +181,26 @@ class GarmentModel(Model):
         lm_mask = data['lm_mask']
         
         with tf.GradientTape() as tape:
-            # Forward pass
             y_pred = self(x, training=True)
-            
-            # Compute segmentation loss (binary cross entropy)
+
             seg_loss = self.compiled_loss(
                 y['segmentation'], 
                 y_pred[0], 
                 regularization_losses=self.losses
             )
-            
-            # Compute landmark loss using masked MSE
+
             masked_mse = masked_mse_loss(lm_mask)
             lm_loss = masked_mse(y['landmarks'], y_pred[1])
-            
-            # Total loss
+
             total_loss = SEGMENTATION_LOSS_WEIGHT * seg_loss + LANDMARK_LOSS_WEIGHT * lm_loss
-        
-        # Compute gradients
+
         trainable_vars = self.trainable_variables
         gradients = tape.gradient(total_loss, trainable_vars)
-        
-        # Update weights
+
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
-        
-        # Update metrics
+
         self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
-        
-        # Return metrics
+
         results = {m.name: m.result() for m in self.metrics}
         results.update({
             'seg_loss': seg_loss,
@@ -258,35 +210,28 @@ class GarmentModel(Model):
         return results
     
     def test_step(self, data):
-        # Unpack the data
         x = data['image']
         y = {
             'segmentation': data['segmentation'],
             'landmarks': data['landmarks']
         }
         lm_mask = data['lm_mask']
-        
-        # Forward pass
+
         y_pred = self(x, training=False)
-        
-        # Compute segmentation loss
+
         seg_loss = self.compiled_loss(
             y['segmentation'], 
             y_pred[0], 
             regularization_losses=self.losses
         )
-        
-        # Compute landmark loss using masked MSE
+
         masked_mse = masked_mse_loss(lm_mask)
         lm_loss = masked_mse(y['landmarks'], y_pred[1])
-        
-        # Total loss
+
         total_loss = SEGMENTATION_LOSS_WEIGHT * seg_loss + LANDMARK_LOSS_WEIGHT * lm_loss
-        
-        # Update metrics
+
         self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
-        
-        # Return metrics
+
         results = {m.name: m.result() for m in self.metrics}
         results.update({
             'seg_loss': seg_loss,
@@ -297,21 +242,16 @@ class GarmentModel(Model):
 
 # Metrics
 def iou_metric(y_true, y_pred, threshold=0.5):
-    """Calculate IoU for segmentation masks."""
-    # Threshold predictions to binary
     y_pred = tf.cast(y_pred > threshold, tf.float32)
     y_true = tf.cast(y_true > threshold, tf.float32)
-    
-    # Calculate intersection and union
+
     intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
     union = tf.reduce_sum(y_true, axis=[1, 2, 3]) + tf.reduce_sum(y_pred, axis=[1, 2, 3]) - intersection
-    
-    # Calculate IoU
+
     iou = intersection / (union + tf.keras.backend.epsilon())
     return tf.reduce_mean(iou)
 
 def main():
-    # Load dataset counts
     try:
         with open('dataset/samples_count.json', 'r') as f:
             counts = json.load(f)
@@ -323,37 +263,30 @@ def main():
             'val': 200,
             'test': 200
         }
-    
-    # Create datasets
+
     print("Creating datasets...")
     train_dataset = create_dataset('dataset/train.tfrecord', augment=True, cache=False)
     val_dataset = create_dataset('dataset/val.tfrecord', augment=False, cache=False)
     test_dataset = create_dataset('dataset/test.tfrecord', augment=False, cache=False)
 
     gc.collect()
-    
-    # Build model
+
     print("Building model...")
     base_model = build_finetuning_model(input_shape=(*IMAGE_SIZE, 3))
     model = GarmentModel(base_model.inputs, base_model.outputs)
-    
-    # Compile model
+
     print("Compiling model...")
     model.compile(
         optimizer=Adam(learning_rate=LEARNING_RATE),
         loss='binary_crossentropy',
         metrics=[iou_metric]
     )
-    
-    # Model summary
+
     model.summary()
-    
-    # Create output directories
+
     os.makedirs('model_checkpoints', exist_ok=True)
-    
-    # Callbacks
+
     callbacks = [
-        # Save best model
         ModelCheckpoint(
             filepath='model_checkpoints/best_model.h5',
             save_best_only=True,
@@ -361,7 +294,6 @@ def main():
             mode='max',
             verbose=1
         ),
-        # Learning rate scheduling
         ReduceLROnPlateau(
             monitor='val_total_loss',
             factor=0.5,
@@ -370,12 +302,10 @@ def main():
             verbose=1
         )
     ]
-    
-    # Calculate steps per epoch
+
     steps_per_epoch = counts['train'] // BATCH_SIZE
     validation_steps = max(1, counts['val'] // BATCH_SIZE)
-    
-    # Train model
+
     print(f"Starting training for {NUM_EPOCHS} epochs...")
     history = model.fit(
         train_dataset,
@@ -386,26 +316,21 @@ def main():
         callbacks=callbacks,
         verbose=1
     )
-    
-    # Save final model
+
     model.save('model_checkpoints/final_model.h5')
     print("Training complete. Final model saved.")
-    
-    # Save training history
+
     with open('model_checkpoints/training_history.json', 'w') as f:
-        # Convert numpy values to Python types for JSON serialization
         serialized_history = {}
         for key, value in history.history.items():
             serialized_history[key] = [float(v) for v in value]
         json.dump(serialized_history, f)
-    
-    # Evaluate on test set
+
     print("Evaluating on test set...")
     test_results = model.evaluate(test_dataset, verbose=1)
     print("Test results:", test_results)
 
 if __name__ == "__main__":
-    # Set memory growth to avoid OOM on GPU
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
@@ -414,6 +339,5 @@ if __name__ == "__main__":
             print(f"Memory growth set for {len(gpus)} GPUs")
         except RuntimeError as e:
             print(f"Memory growth setting failed: {e}")
-    
-    # Run main function
+
     main()

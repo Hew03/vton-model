@@ -46,8 +46,7 @@ def process_sample(sample):
         img_height, img_width = img.shape[:2]
         resized_img = cv2.resize(img, IMAGE_SIZE)
         resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
-        
-        # Segmentation mask (3 channels)
+
         seg_mask = np.zeros((IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
         for i, submask in enumerate(sample['segmentation']):
             if not submask:
@@ -62,21 +61,17 @@ def process_sample(sample):
             seg_mask[:, :, i] = temp_mask
         
         seg_mask = seg_mask.astype(np.float32)
-        
-        # Landmarks processing (25 landmarks with visibility)
+
         landmarks = np.array(sample['landmarks'], dtype=np.float32)
-        landmarks = landmarks.reshape(-1, 3)  # Reshape to (25, 3)
-        
-        # Normalize coordinates
-        landmarks[:, 0] /= img_width   # X coordinates
-        landmarks[:, 1] /= img_height  # Y coordinates
-        
-        # Create visibility mask (1 for visible, 0 for invisible)
+        landmarks = landmarks.reshape(-1, 3)
+
+        landmarks[:, 0] /= img_width
+        landmarks[:, 1] /= img_height
+
         lm_mask = (landmarks[:, 2] > 0).astype(np.float32)
-        lm_mask = np.repeat(lm_mask, 2)  # Shape (50,)
-        landmarks = landmarks[:, :2].flatten()  # Flatten to 50 values (25x2)
-                
-        # Encode image
+        lm_mask = np.repeat(lm_mask, 2)
+        landmarks = landmarks[:, :2].flatten()
+
         _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         
         return {
@@ -108,9 +103,7 @@ def create_tfrecord(samples, output_path, preview_limit=5):
             writer.write(example.SerializeToString())
             valid_count += 1
 
-            # Collect preview data (convert bytes back to numpy for JSON)
             if len(preview_samples) < preview_limit:
-                # Deserialize landmarks and lm_mask to lists for JSON
                 landmarks = tf.io.parse_tensor(processed['landmarks'], out_type=tf.float32).numpy().tolist()
                 lm_mask = tf.io.parse_tensor(processed['lm_mask'], out_type=tf.float32).numpy().tolist()
                 
@@ -123,7 +116,6 @@ def create_tfrecord(samples, output_path, preview_limit=5):
 
     print(f"Saved {valid_count}/{len(samples)} valid samples to {output_path}")
 
-    # Save preview JSON
     preview_path = os.path.splitext(output_path)[0] + '_preview.json'
     with open(preview_path, 'w') as f:
         json.dump(preview_samples, f, indent=2)
