@@ -10,7 +10,7 @@ IMAGE_SIZE = (256, 256)
 NUM_LANDMARKS = 25
 NUM_SEGMENTATION_CHANNELS = 3
 
-def build_finetuning_model(input_shape=(256, 256, 3)):
+def build_model(input_shape=(256, 256, 3)):
     base_model = MobileNetV2(
         input_shape=input_shape,
         include_top=False,
@@ -76,7 +76,7 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     
     return Model(inputs=input_image, outputs=[seg_output, lm_output])
 
-model = build_finetuning_model()
+model = build_model()
 model.load_weights('model_checkpoints/final_model.h5')
 
 def preprocess_image(image_path):

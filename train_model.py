@@ -90,7 +90,7 @@ def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=Fa
     
     return dataset
 
-def build_finetuning_model(input_shape=(256, 256, 3)):
+def build_model(input_shape=(256, 256, 3)):
     base_model = MobileNetV2(
         input_shape=input_shape,
         include_top=False,
@@ -156,6 +156,10 @@ def build_finetuning_model(input_shape=(256, 256, 3)):
     
     return Model(inputs=input_image, outputs=[seg_output, lm_output])
 
+def binary_crossentropy_loss(y_true, y_pred):
+    """Direct implementation of binary crossentropy"""
+    return tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
+
 def masked_mse_loss(lm_mask):
     def loss(y_true, y_pred):
         masked_true = y_true * lm_mask
@@ -179,11 +183,27 @@ def masked_mae(y_true, y_pred, lm_mask):
     mae = tf.reduce_sum(tf.abs(masked_true - masked_pred)) / (tf.reduce_sum(lm_mask) + tf.keras.backend.epsilon())
     return mae
 
+def iou_metric(y_true, y_pred, threshold=0.5):
+    """IoU metric function for model compilation"""
+    y_pred = tf.cast(y_pred > threshold, tf.float32)
+    y_true = tf.cast(y_true > threshold, tf.float32)
+
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
+    union = tf.reduce_sum(y_true, axis=[1, 2, 3]) + tf.reduce_sum(y_pred, axis=[1, 2, 3]) - intersection
+
+    iou = intersection / (union + tf.keras.backend.epsilon())
+    return tf.reduce_mean(iou)
+
 class GarmentModel(Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Custom metrics
         self.dice_metric = tf.keras.metrics.Mean(name='dice')
         self.mae_metric = tf.keras.metrics.Mean(name='mae')
+        self.iou_metric_tracker = tf.keras.metrics.Mean(name='segmentation_iou_metric')
+        self.seg_loss_tracker = tf.keras.metrics.Mean(name='seg_loss')
+        self.lm_loss_tracker = tf.keras.metrics.Mean(name='lm_loss')
+        self.total_loss_tracker = tf.keras.metrics.Mean(name='total_loss')
 
     def train_step(self, data):
         x = data['image']
@@ -195,13 +215,10 @@ class GarmentModel(Model):
         
         with tf.GradientTape() as tape:
             y_pred = self(x, training=True)
-
-            seg_loss = self.compiled_loss(
-                y['segmentation'], 
-                y_pred[0], 
-                regularization_losses=self.losses
-            )
-
+            
+            # Calculate seg_loss directly without using compiled_loss
+            seg_loss = binary_crossentropy_loss(y['segmentation'], y_pred[0])
+            
             masked_mse = masked_mse_loss(lm_mask)
             lm_loss = masked_mse(y['landmarks'], y_pred[1])
 
@@ -212,25 +229,30 @@ class GarmentModel(Model):
 
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
 
-        # Compute metrics
-        dice = dice_metric(y['segmentation'], y_pred[0])
-        self.dice_metric.update_state(dice)
+        # Update metrics
+        dice_value = dice_metric(y['segmentation'], y_pred[0])
+        self.dice_metric.update_state(dice_value)
 
-        mae = masked_mae(y['landmarks'], y_pred[1], lm_mask)
-        self.mae_metric.update_state(mae)
+        mae_value = masked_mae(y['landmarks'], y_pred[1], lm_mask)
+        self.mae_metric.update_state(mae_value)
+        
+        iou_value = iou_metric(y['segmentation'], y_pred[0])
+        self.iou_metric_tracker.update_state(iou_value)
+        
+        # Track losses
+        self.seg_loss_tracker.update_state(seg_loss)
+        self.lm_loss_tracker.update_state(lm_loss)
+        self.total_loss_tracker.update_state(total_loss)
 
-        # Update compiled metrics (segmentation)
-        self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
-
-        results = {m.name: m.result() for m in self.metrics}
-        results.update({
-            'seg_loss': seg_loss,
-            'lm_loss': lm_loss,
-            'total_loss': total_loss,
+        # Build results dict from all metrics
+        return {
+            'seg_loss': self.seg_loss_tracker.result(),
+            'lm_loss': self.lm_loss_tracker.result(),
+            'total_loss': self.total_loss_tracker.result(),
             'dice': self.dice_metric.result(),
-            'mae': self.mae_metric.result()
-        })
-        return results
+            'mae': self.mae_metric.result(),
+            'segmentation_iou_metric': self.iou_metric_tracker.result()
+        }
     
     def test_step(self, data):
         x = data['image']
@@ -242,51 +264,60 @@ class GarmentModel(Model):
 
         y_pred = self(x, training=False)
 
-        seg_loss = self.compiled_loss(
-            y['segmentation'], 
-            y_pred[0], 
-            regularization_losses=self.losses
-        )
+        # Calculate seg_loss directly without using compiled_loss
+        seg_loss = binary_crossentropy_loss(y['segmentation'], y_pred[0])
 
         masked_mse = masked_mse_loss(lm_mask)
         lm_loss = masked_mse(y['landmarks'], y_pred[1])
 
         total_loss = SEGMENTATION_LOSS_WEIGHT * seg_loss + LANDMARK_LOSS_WEIGHT * lm_loss
 
-        # Compute metrics
-        dice = dice_metric(y['segmentation'], y_pred[0])
-        self.dice_metric.update_state(dice)
+        # Update metrics
+        dice_value = dice_metric(y['segmentation'], y_pred[0])
+        self.dice_metric.update_state(dice_value)
 
-        mae = masked_mae(y['landmarks'], y_pred[1], lm_mask)
-        self.mae_metric.update_state(mae)
+        mae_value = masked_mae(y['landmarks'], y_pred[1], lm_mask)
+        self.mae_metric.update_state(mae_value)
+        
+        iou_value = iou_metric(y['segmentation'], y_pred[0])
+        self.iou_metric_tracker.update_state(iou_value)
+        
+        # Track losses
+        self.seg_loss_tracker.update_state(seg_loss)
+        self.lm_loss_tracker.update_state(lm_loss)
+        self.total_loss_tracker.update_state(total_loss)
 
-        # Update compiled metrics (segmentation)
-        self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
-
-        results = {m.name: m.result() for m in self.metrics}
-        results.update({
-            'seg_loss': seg_loss,
-            'lm_loss': lm_loss,
-            'total_loss': total_loss,
+        # Build results dict from all metrics
+        return {
+            'seg_loss': self.seg_loss_tracker.result(),
+            'lm_loss': self.lm_loss_tracker.result(),
+            'total_loss': self.total_loss_tracker.result(),
             'dice': self.dice_metric.result(),
-            'mae': self.mae_metric.result()
-        })
-        return results
+            'mae': self.mae_metric.result(),
+            'segmentation_iou_metric': self.iou_metric_tracker.result()
+        }
 
     def reset_metrics(self):
         super().reset_metrics()
         self.dice_metric.reset_state()
         self.mae_metric.reset_state()
-
-def iou_metric(y_true, y_pred, threshold=0.5):
-    y_pred = tf.cast(y_pred > threshold, tf.float32)
-    y_true = tf.cast(y_true > threshold, tf.float32)
-
-    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
-    union = tf.reduce_sum(y_true, axis=[1, 2, 3]) + tf.reduce_sum(y_pred, axis=[1, 2, 3]) - intersection
-
-    iou = intersection / (union + tf.keras.backend.epsilon())
-    return tf.reduce_mean(iou)
+        self.iou_metric_tracker.reset_state()
+        self.seg_loss_tracker.reset_state()
+        self.lm_loss_tracker.reset_state()
+        self.total_loss_tracker.reset_state()
+        
+    @property
+    def metrics(self):
+        # Define metrics list
+        metrics = [
+            self.dice_metric,
+            self.mae_metric, 
+            self.iou_metric_tracker,
+            self.seg_loss_tracker,
+            self.lm_loss_tracker,
+            self.total_loss_tracker
+        ]
+        return metrics
 
 def main():
     try:
@@ -309,15 +340,12 @@ def main():
     gc.collect()
 
     print("Building model...")
-    base_model = build_finetuning_model(input_shape=(*IMAGE_SIZE, 3))
+    base_model = build_model(input_shape=(*IMAGE_SIZE, 3))
     model = GarmentModel(base_model.inputs, base_model.outputs)
 
     print("Compiling model...")
-    model.compile(
-        optimizer=Adam(learning_rate=LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=[iou_metric]
-    )
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE))
+    # Removed loss function and metrics as we're handling those in custom train/test steps
 
     model.summary()
 
@@ -327,7 +355,7 @@ def main():
         ModelCheckpoint(
             filepath='model_checkpoints/best_model.h5',
             save_best_only=True,
-            monitor='val_iou_metric',
+            monitor='val_segmentation_iou_metric',
             mode='max',
             verbose=1
         ),
@@ -361,25 +389,22 @@ def main():
         serialized_history = {}
         for key, value in history.history.items():
             serialized_history[key] = [float(v) for v in value]
-        json.dump(serialized_history, f)
+        json.dump(serialized_history, f, indent=2)
 
     print("Evaluating on test set...")
-    test_results = model.evaluate(test_dataset, verbose=1)
+    test_results = model.evaluate(test_dataset, verbose=1, return_dict=True)
     print("Test results:", test_results)
 
     # Save test metrics
-    test_metrics = {
-        'test_loss': float(test_results[0]),
-        'test_iou_metric': float(test_results[1]),
-        'test_seg_loss': float(test_results[2]),
-        'test_lm_loss': float(test_results[3]),
-        'test_total_loss': float(test_results[4]),
-        'test_dice': float(test_results[5]),
-        'test_mae': float(test_results[6])
-    }
-
+    test_metrics = {}
+    
+    # Process the metrics directly from the return_dict
+    for key, value in test_results.items():
+        test_metrics[f'test_{key}'] = float(value)
+    
     with open('model_checkpoints/test_metrics.json', 'w') as f:
         json.dump(test_metrics, f, indent=2)
+
 if __name__ == "__main__":
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
