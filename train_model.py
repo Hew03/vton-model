@@ -51,9 +51,7 @@ def parse_tfrecord_fn(example):
 def random_brightness_contrast(image, segmentation, landmarks, lm_mask):
     if tf.random.uniform(()) > 0.5:
         image = tf.image.random_brightness(image, max_delta=0.1)
-        
         image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
-        
         image = tf.clip_by_value(image, 0.0, 1.0)
     
     return image, segmentation, landmarks, lm_mask
@@ -65,7 +63,6 @@ def augment_data(data):
     lm_mask = data['lm_mask']
     
     image, segmentation, landmarks, lm_mask = random_brightness_contrast(image, segmentation, landmarks, lm_mask)
-    # Removed other augmentations, was causing issues
     
     return {
         'image': image,
@@ -79,11 +76,10 @@ def create_dataset(tfrecord_path, augment=False, batch_size=BATCH_SIZE, cache=Fa
         raise FileNotFoundError(f"TFRecord file not found: {tfrecord_path}")
     
     dataset = tf.data.TFRecordDataset(tfrecord_path)
-    
     dataset = dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
     
     if cache:
-        dataset = dataset.cache() # Its here but I DO NOT RECOMMEND unlsess you have infinite RAM
+        dataset = dataset.cache()
     
     if augment:
         dataset = dataset.map(augment_data, num_parallel_calls=tf.data.AUTOTUNE)
@@ -169,7 +165,26 @@ def masked_mse_loss(lm_mask):
         return mse
     return loss
 
+def dice_metric(y_true, y_pred, threshold=0.5):
+    y_pred = tf.cast(y_pred > threshold, tf.float32)
+    y_true = tf.cast(y_true > threshold, tf.float32)
+    intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
+    union = tf.reduce_sum(y_true, axis=[1, 2, 3]) + tf.reduce_sum(y_pred, axis=[1, 2, 3])
+    dice = (2. * intersection) / (union + tf.keras.backend.epsilon())
+    return tf.reduce_mean(dice)
+
+def masked_mae(y_true, y_pred, lm_mask):
+    masked_true = y_true * lm_mask
+    masked_pred = y_pred * lm_mask
+    mae = tf.reduce_sum(tf.abs(masked_true - masked_pred)) / (tf.reduce_sum(lm_mask) + tf.keras.backend.epsilon())
+    return mae
+
 class GarmentModel(Model):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dice_metric = tf.keras.metrics.Mean(name='dice')
+        self.mae_metric = tf.keras.metrics.Mean(name='mae')
+
     def train_step(self, data):
         x = data['image']
         y = {
@@ -197,13 +212,23 @@ class GarmentModel(Model):
 
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
 
+        # Compute metrics
+        dice = dice_metric(y['segmentation'], y_pred[0])
+        self.dice_metric.update_state(dice)
+
+        mae = masked_mae(y['landmarks'], y_pred[1], lm_mask)
+        self.mae_metric.update_state(mae)
+
+        # Update compiled metrics (segmentation)
         self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
 
         results = {m.name: m.result() for m in self.metrics}
         results.update({
             'seg_loss': seg_loss,
             'lm_loss': lm_loss,
-            'total_loss': total_loss
+            'total_loss': total_loss,
+            'dice': self.dice_metric.result(),
+            'mae': self.mae_metric.result()
         })
         return results
     
@@ -228,17 +253,31 @@ class GarmentModel(Model):
 
         total_loss = SEGMENTATION_LOSS_WEIGHT * seg_loss + LANDMARK_LOSS_WEIGHT * lm_loss
 
+        # Compute metrics
+        dice = dice_metric(y['segmentation'], y_pred[0])
+        self.dice_metric.update_state(dice)
+
+        mae = masked_mae(y['landmarks'], y_pred[1], lm_mask)
+        self.mae_metric.update_state(mae)
+
+        # Update compiled metrics (segmentation)
         self.compiled_metrics.update_state(y['segmentation'], y_pred[0])
 
         results = {m.name: m.result() for m in self.metrics}
         results.update({
             'seg_loss': seg_loss,
             'lm_loss': lm_loss,
-            'total_loss': total_loss
+            'total_loss': total_loss,
+            'dice': self.dice_metric.result(),
+            'mae': self.mae_metric.result()
         })
         return results
 
-# Metrics
+    def reset_metrics(self):
+        super().reset_metrics()
+        self.dice_metric.reset_state()
+        self.mae_metric.reset_state()
+
 def iou_metric(y_true, y_pred, threshold=0.5):
     y_pred = tf.cast(y_pred > threshold, tf.float32)
     y_true = tf.cast(y_true > threshold, tf.float32)
@@ -328,6 +367,19 @@ def main():
     test_results = model.evaluate(test_dataset, verbose=1)
     print("Test results:", test_results)
 
+    # Save test metrics
+    test_metrics = {
+        'test_loss': float(test_results[0]),
+        'test_iou_metric': float(test_results[1]),
+        'test_seg_loss': float(test_results[2]),
+        'test_lm_loss': float(test_results[3]),
+        'test_total_loss': float(test_results[4]),
+        'test_dice': float(test_results[5]),
+        'test_mae': float(test_results[6])
+    }
+
+    with open('model_checkpoints/test_metrics.json', 'w') as f:
+        json.dump(test_metrics, f, indent=2)
 if __name__ == "__main__":
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
